@@ -15,6 +15,7 @@ static void on_video(void *c, const uint8_t *y, const uint8_t *u, const uint8_t 
                      int w, int h, int sn, int sd, int64_t pts) {
     (void)c;
     if (frames == 0) printf("first video frame %dx%d sar %d/%d pts %.3f s\n", w, h, sn, sd, pts / 90000.0);
+    if (frames < 8) printf("  video pts %.4f\n", pts / 90000.0);
     if (++frames == want_frame && !wrote) {
         FILE *f = fopen(outpath, "wb");
         fprintf(f, "P6 %d %d 255\n", w, h);
@@ -30,7 +31,7 @@ static void on_video(void *c, const uint8_t *y, const uint8_t *u, const uint8_t 
     }
 }
 static void on_audio(void *c, const float *s, int n, int rate, int64_t pts) {
-    (void)c; (void)s; (void)rate; (void)pts; audio_frames += n;
+    (void)c; (void)s; (void)rate; static int na; if (na++ < 8) printf("  audio pts %.4f (%d samples)\n", pts / 90000.0, n); audio_frames += n;
 }
 static void on_channels(void *c, const atsc_vchannel *ch, int n) {
     (void)c;

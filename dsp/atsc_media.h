@@ -56,6 +56,12 @@ void atsc_media_reset(atsc_media *m);
 /// Decode this MPEG program_number (0: the first one listed).
 void atsc_media_select(atsc_media *m, int program);
 
+/// PIDs needed to record the selected program (PAT, its PMT, video, audio, PSIP). Returns count.
+int atsc_media_selected_pids(atsc_media *m, int *pids, int max);
+
+/// The program number currently being decoded, or -1.
+int atsc_media_current_program(atsc_media *m);
+
 /// Feed one 188-byte transport packet. Packets with `ok` == 0 are counted and dropped.
 void atsc_media_push(atsc_media *m, const uint8_t pkt[188], int ok);
 

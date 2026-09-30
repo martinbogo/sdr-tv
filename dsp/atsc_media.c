@@ -55,6 +55,7 @@ struct atsc_media {
     SwrContext *swr; int swr_in_ch, swr_rate, swr_fmt;
     float *abuf; int abuf_cap;
     int fmt_w, fmt_h, fmt_i, fmt_ach;
+    int64_t a_next_pts, v_next_pts, v_frame_dur;
 
     uint64_t dropped;
 };
@@ -269,6 +270,7 @@ static void close_decoders(atsc_media *m) {
     m->vparser = m->aparser = NULL;
     m->vpes.started = m->apes.started = 0; m->vpes.len = m->apes.len = 0;
     m->fmt_w = m->fmt_h = m->fmt_ach = -1;
+    m->a_next_pts = m->v_next_pts = AV_NOPTS_VALUE; m->v_frame_dur = 0;
 }
 
 static void open_decoders(atsc_media *m) {
@@ -330,7 +332,11 @@ static void decode_video(atsc_media *m, AVPacket *pk) {
     if (avcodec_send_packet(m->vdec, pk) < 0) return;
     while (avcodec_receive_frame(m->vdec, m->frame) == 0) {
         AVFrame *f = m->frame;
-        f->pts = f->best_effort_timestamp;
+        if (f->pts == AV_NOPTS_VALUE) f->pts = f->best_effort_timestamp;
+        if (m->vdec->framerate.num > 0)
+            m->v_frame_dur = (int64_t)90000 * m->vdec->framerate.den / m->vdec->framerate.num;
+        if (f->pts == AV_NOPTS_VALUE && m->v_next_pts != AV_NOPTS_VALUE) f->pts = m->v_next_pts;
+        if (f->pts != AV_NOPTS_VALUE) m->v_next_pts = f->pts + (m->v_frame_dur ? m->v_frame_dur : 3003);
         int interlaced = (f->flags & AV_FRAME_FLAG_INTERLACED) != 0;
         if (m->fmt_w != f->width || m->fmt_h != f->height || m->fmt_i != interlaced) {
             m->fmt_w = f->width; m->fmt_h = f->height; m->fmt_i = interlaced;
@@ -342,7 +348,9 @@ static void decode_video(atsc_media *m, AVPacket *pk) {
             if (build_graph(m, f) < 0) { emit_video(m, f); av_frame_unref(f); continue; }
         }
         if (av_buffersrc_add_frame_flags(m->src, f, AV_BUFFERSRC_FLAG_KEEP_REF) >= 0) {
+            AVRational tb = av_buffersink_get_time_base(m->sink);   // bwdif doubles the time base
             while (av_buffersink_get_frame(m->sink, m->filt) >= 0) {
+                if (m->filt->pts != AV_NOPTS_VALUE) m->filt->pts = av_rescale_q(m->filt->pts, tb, (AVRational){1, 90000});
                 emit_video(m, m->filt);
                 av_frame_unref(m->filt);
             }
@@ -372,19 +380,25 @@ static void decode_audio(atsc_media *m, AVPacket *pk) {
         if (outn * 2 > m->abuf_cap) { m->abuf_cap = outn * 2; m->abuf = realloc(m->abuf, sizeof(float) * m->abuf_cap); }
         uint8_t *outp[1] = {(uint8_t *)m->abuf};
         int got = swr_convert(m->swr, outp, outn, (const uint8_t **)f->extended_data, f->nb_samples);
-        if (got > 0 && m->cb.audio) m->cb.audio(m->cb.ctx, m->abuf, got, f->sample_rate, f->pts);
+        // Several AC-3 frames share one PES timestamp; the ones after the first carry none.
+        // Continue the timeline from the previous frame instead of dropping them.
+        int64_t pts = f->pts;
+        if (pts == AV_NOPTS_VALUE || (m->a_next_pts != AV_NOPTS_VALUE && llabs(pts - m->a_next_pts) < 900))
+            pts = m->a_next_pts;                       // also smooths sub-10 ms timestamp jitter
+        if (pts != AV_NOPTS_VALUE) m->a_next_pts = pts + (int64_t)got * 90000 / f->sample_rate;
+        if (got > 0 && pts != AV_NOPTS_VALUE && m->cb.audio) m->cb.audio(m->cb.ctx, m->abuf, got, f->sample_rate, pts);
         av_frame_unref(f);
     }
 }
 
-static void parse_es(atsc_media *m, int video, const uint8_t *d, int n, int64_t pts) {
+static void parse_es(atsc_media *m, int video, const uint8_t *d, int n, int64_t pts, int64_t dts) {
     AVCodecParserContext *p = video ? m->vparser : m->aparser;
     AVCodecContext *c = video ? m->vdec : m->adec;
     if (!p || !c) return;
     while (n > 0) {
         uint8_t *out; int outn;
-        int used = av_parser_parse2(p, c, &out, &outn, d, n, pts, pts, 0);
-        pts = AV_NOPTS_VALUE;
+        int used = av_parser_parse2(p, c, &out, &outn, d, n, pts, dts, 0);
+        pts = dts = AV_NOPTS_VALUE;
         d += used; n -= used;
         if (outn) {
             m->pkt->data = out; m->pkt->size = outn;
@@ -397,19 +411,24 @@ static void parse_es(atsc_media *m, int video, const uint8_t *d, int n, int64_t 
 
 static void pes_packet(atsc_media *m, int video, const uint8_t *p, int n, int pusi) {
     pes_buf *pb = video ? &m->vpes : &m->apes;
-    int64_t pts = AV_NOPTS_VALUE;
+    int64_t pts = AV_NOPTS_VALUE, dts = AV_NOPTS_VALUE;
     if (pusi) {
         if (n < 9 || p[0] != 0 || p[1] != 0 || p[2] != 1) { pb->started = 0; return; }
         int hlen = p[8];
         if ((p[7] & 0x80) && n >= 14) {
             pts = ((int64_t)(p[9] & 0x0E) << 29) | ((int64_t)p[10] << 22) | ((int64_t)(p[11] & 0xFE) << 14) |
                   ((int64_t)p[12] << 7) | (p[13] >> 1);
+            dts = pts;                                  // equal unless a DTS is also present
+        }
+        if ((p[7] & 0xC0) == 0xC0 && n >= 19) {     // PTS and DTS both present (reordered video)
+            dts = ((int64_t)(p[14] & 0x0E) << 29) | ((int64_t)p[15] << 22) | ((int64_t)(p[16] & 0xFE) << 14) |
+                  ((int64_t)p[17] << 7) | (p[18] >> 1);
         }
         if (9 + hlen > n) { pb->started = 0; return; }
         p += 9 + hlen; n -= 9 + hlen;
         pb->started = 1;
     } else if (!pb->started) return;
-    parse_es(m, video, p, n, pts);
+    parse_es(m, video, p, n, pts, dts);
 }
 
 // ----------------------------------------------------------------------------- public
@@ -441,6 +460,16 @@ void atsc_media_reset(atsc_media *m) {
     m->nprog = 0; m->nch = 0; npmt = 0;
     m->cur_program = -1; m->video_pid = m->audio_pid = -1;
 }
+
+int atsc_media_selected_pids(atsc_media *m, int *pids, int max) {
+    int n = 0, pmt = -1;
+    for (int k = 0; k < m->nprog; k++) if (m->prog_list[k] == m->cur_program) pmt = m->prog_pmt[k];
+    int cand[5] = {0x0000, pmt, m->video_pid, m->audio_pid, 0x1FFB};
+    for (int i = 0; i < 5 && n < max; i++) if (cand[i] >= 0) pids[n++] = cand[i];
+    return n;
+}
+
+int atsc_media_current_program(atsc_media *m) { return m->cur_program; }
 
 void atsc_media_select(atsc_media *m, int program) {
     m->want_program = program;
