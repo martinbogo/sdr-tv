@@ -6,3 +6,4 @@ captures/
 __pycache__/
 .DS_Store
 docs/
+third_party/
