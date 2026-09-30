@@ -56,6 +56,22 @@ void atsc_media_reset(atsc_media *m);
 /// Decode this MPEG program_number (0: the first one listed).
 void atsc_media_select(atsc_media *m, int program);
 
+/// What the demultiplexer and decoders have achieved for the selected program, for diagnostics.
+typedef struct {
+    int tables_seen;             // PAT received
+    int program_listed;          // the selected program is in the PAT
+    int program_mapped;          // its PMT has been received
+    int video_type, audio_type;  // MPEG stream_type of the chosen streams (0 = none)
+    int video_supported, audio_supported;
+    uint64_t video_frames, audio_frames;   // decoded since the program was selected
+    uint64_t dropped_packets;    // packets lost to uncorrectable errors
+} atsc_media_status;
+
+void atsc_media_get_status(atsc_media *m, atsc_media_status *out);
+
+/// Human-readable codec name for an MPEG stream_type ("MPEG-2", "H.264", "AC-3", ...).
+const char *atsc_stream_type_name(int stream_type);
+
 /// PIDs needed to record the selected program (PAT, its PMT, video, audio, PSIP). Returns count.
 int atsc_media_selected_pids(atsc_media *m, int *pids, int max);
 

@@ -71,6 +71,7 @@ struct TVScreen: View {
                 VStack(alignment: .trailing, spacing: 12) {
                     if !tv.entry.isEmpty { EntryOSD(text: tv.entry) }
                     if let since = tv.recordingSince { RecordingOSD(since: since) }
+                    if tv.weakSignal { WeakSignalOSD() }
                     Spacer()
                     if tv.volumeVisible { VolumeOSD() .transition(.opacity) }
                     Spacer()
@@ -104,14 +105,8 @@ struct TVScreen: View {
                     .font(.callout).foregroundStyle(.secondary)
             }
             .foregroundStyle(.white.opacity(0.85))
-        } else if !tv.hasPicture, !tv.scanning, !tv.setupVisible, let ch = tv.current {
-            VStack(spacing: 8) {
-                if tv.stats.state == ATSC_LOCKED { ProgressView().controlSize(.large).tint(.white) }
-                else { Image(systemName: "antenna.radiowaves.left.and.right.slash").font(.system(size: 40)) }
-                Text(tv.stats.state == ATSC_LOCKED ? "Tuning \(ch.number) \(ch.name)…" : "No signal on \(ch.number) \(ch.name)")
-                    .font(.title3)
-            }
-            .foregroundStyle(.white.opacity(0.8))
+        } else if !tv.hasPicture, !tv.scanning, !tv.setupVisible, !tv.rechecking, tv.current != nil {
+            TuningOSD()
         }
     }
 
@@ -205,6 +200,7 @@ struct ChannelBanner: View {
                 VStack(alignment: .trailing, spacing: 8) {
                     Text(Date().formatted(date: .omitted, time: .shortened)).font(.title3.weight(.medium)).monospacedDigit()
                     HStack(spacing: 8) {
+                        if !tv.videoCodec.isEmpty { Badge(tv.videoCodec) }
                         if !tv.format.isEmpty { Badge(tv.format) }
                         if !tv.audioLayout.isEmpty { Badge(tv.audioLayout) }
                         SignalBars(bars: tv.bars)
@@ -519,14 +515,22 @@ struct ChannelSettings: View {
             }
             Table(tv.allChannels) {
                 TableColumn("Show") { ch in
-                    Toggle("", isOn: Binding(get: { !ch.hidden }, set: { tv.setHidden(ch, !$0) })).labelsHidden()
+                    Toggle("", isOn: Binding(get: { !ch.hidden && !ch.isUnavailable }, set: { tv.setHidden(ch, !$0) }))
+                        .labelsHidden()
+                        .help(ch.isUnavailable ? "Hidden because it was too weak to receive. Turn on to try it again." : "")
                 }
                 .width(40)
                 TableColumn("Channel") { ch in Text(ch.number).monospacedDigit() }.width(64)
                 TableColumn("Name", value: \.name)
                 TableColumn("RF") { ch in Text("\(ch.rf)").monospacedDigit() }.width(36)
-                TableColumn("Signal") { ch in Text(ch.signalDB > 0 ? String(format: "%.0f dB", ch.signalDB) : "–").monospacedDigit() }
-                    .width(56)
+                TableColumn("Signal") { ch in
+                    if ch.isUnavailable {
+                        Text("Too weak").foregroundStyle(.orange)
+                    } else {
+                        Text(ch.signalDB > 0 ? String(format: "%.0f dB", ch.signalDB) : "–").monospacedDigit()
+                    }
+                }
+                .width(70)
             }
         }
         .padding(20)
@@ -627,4 +631,68 @@ struct SetupSheet: View {
     }
 
     private func bars(_ snr: Double) -> Int { snr < 15 ? 1 : snr < 18 ? 2 : snr < 21 ? 3 : 4 }
+}
+
+// MARK: - reception diagnostics
+
+/// Replaces a bare "Tuning…": shows each stage of reception live, what the automatic rescue is
+/// trying, and a plain explanation when something fails.
+struct TuningOSD: View {
+    @EnvironmentObject var tv: TV
+
+    var body: some View {
+        let d = tv.diagnosis
+        OSDPanel {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    Text(tv.current?.number ?? "").font(.system(size: 30, weight: .semibold, design: .rounded)).monospacedDigit()
+                    Text(tv.current?.name ?? "").font(.title3)
+                    Spacer()
+                    Text("RF \(tv.current?.rf ?? 0) · \(Int(RFBand.centerMHz(tv.current?.rf ?? 14))) MHz")
+                        .font(.callout).foregroundStyle(.secondary).monospacedDigit()
+                }
+                VStack(alignment: .leading, spacing: 7) {
+                    ForEach(d.stages) { st in
+                        HStack(alignment: .firstTextBaseline, spacing: 10) {
+                            icon(st.state).frame(width: 16)
+                            Text(st.title).font(.callout.weight(.semibold)).frame(width: 64, alignment: .leading)
+                            Text(st.detail).font(.callout).foregroundStyle(st.state == .pending ? .tertiary : .primary)
+                                .monospacedDigit()
+                        }
+                    }
+                }
+                if let note = tv.rescueNote {
+                    Label(note, systemImage: "wand.and.stars").font(.callout).foregroundStyle(.yellow)
+                } else if let hint = d.hint {
+                    Text(hint).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .frame(width: 520)
+        }
+        .foregroundStyle(.white)
+    }
+
+    @ViewBuilder private func icon(_ s: TV.Stage.State) -> some View {
+        switch s {
+        case .ok: Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+        case .working: ProgressView().controlSize(.mini).tint(.white)
+        case .warning: Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.yellow)
+        case .failed: Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
+        case .pending: Image(systemName: "circle").foregroundStyle(.tertiary)
+        }
+    }
+}
+
+struct WeakSignalOSD: View {
+    @EnvironmentObject var tv: TV
+    var body: some View {
+        HStack(spacing: 8) {
+            SignalBars(bars: tv.bars)
+            Text(tv.lossRate > 0.02 ? String(format: "Weak signal · %.0f%% lost", tv.lossRate * 100) : "Weak signal")
+                .font(.callout.weight(.semibold)).monospacedDigit()
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 12).padding(.vertical, 6)
+        .background(.black.opacity(0.55), in: Capsule())
+    }
 }

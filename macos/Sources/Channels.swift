@@ -33,6 +33,12 @@ struct VirtualChannel: Codable, Hashable, Identifiable {
     var lna: Int?
     var vga: Int?
     var amp: Bool?
+    /// Set when every receiver setting failed to decode it; hidden until re-enabled, rescanned,
+    /// or a launch-time re-check succeeds. Separate from `hidden`, which is the user's choice.
+    var unavailable: Bool?
+    var bestSNR: Double?
+
+    var isUnavailable: Bool { unavailable ?? false }
 
     var id: String { "\(major).\(minor)" }
     var number: String { "\(major).\(minor)" }
@@ -69,7 +75,27 @@ final class Library {
         prune()
     }
 
-    var visibleChannels: [VirtualChannel] { channels.filter { !$0.hidden } }
+    var visibleChannels: [VirtualChannel] { channels.filter { !$0.hidden && !$0.isUnavailable } }
+    var unavailableRFs: [Int] { Array(Set(channels.filter { $0.isUnavailable && !$0.hidden }.map(\.rf))).sorted() }
+
+    /// Every channel on `rf` could not be decoded with any setting.
+    func markUnavailable(rf: Int, bestSNR: Double) {
+        for i in channels.indices where channels[i].rf == rf { channels[i].unavailable = true; channels[i].bestSNR = bestSNR }
+        save()
+    }
+
+    func restore(rf: Int) {
+        for i in channels.indices where channels[i].rf == rf { channels[i].unavailable = nil }
+        save()
+    }
+
+    /// Receiver settings that worked for an RF channel.
+    func setGains(rf: Int, lna: Int, vga: Int, amp: Bool) {
+        for i in channels.indices where channels[i].rf == rf {
+            channels[i].lna = lna; channels[i].vga = vga; channels[i].amp = amp
+        }
+        save()
+    }
 
     func setChannels(_ list: [VirtualChannel]) {
         channels = list.sorted { ($0.major, $0.minor) < ($1.major, $1.minor) }
@@ -94,7 +120,11 @@ final class Library {
     }
 
     func setHidden(_ id: String, _ hidden: Bool) {
-        if let i = channels.firstIndex(where: { $0.id == id }) { channels[i].hidden = hidden; save() }
+        if let i = channels.firstIndex(where: { $0.id == id }) {
+            channels[i].hidden = hidden
+            if !hidden { channels[i].unavailable = nil }     // showing it again means "try it"
+            save()
+        }
     }
 
     func add(event e: GuideEvent, key: String) {

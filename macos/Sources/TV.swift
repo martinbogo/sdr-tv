@@ -55,6 +55,37 @@ final class TV: ObservableObject {
     private var retryTicks = 0
     private var lockedAt: Date?
 
+    // reception health
+    @Published private(set) var media = atsc_media_status()
+    var videoCodec: String { media.video_type != 0 ? String(cString: atsc_stream_type_name(media.video_type)) : "" }
+    var audioCodec: String { media.audio_type != 0 ? String(cString: atsc_stream_type_name(media.audio_type)) : "" }
+    @Published private(set) var lossRate = 0.0       // fraction of packets lost over the last ~2 s
+    @Published private(set) var weakSignal = false   // picture showing but data being lost
+    @Published private(set) var rescueNote: String?  // what the automatic rescue is trying
+    private var tunedAt = Date()
+    private var lastFrameAt: Date?
+    private var lastVideoFrames: UInt64 = 0
+    private var rsHist: [(good: UInt64, bad: UInt64)] = []
+    private var rescue: Rescue?
+    @Published private(set) var rechecking = false
+
+    /// Receiver settings tried, in order, when a channel will not decode.
+    private struct Rescue {
+        var rf: Int
+        var step = 0
+        var stepStarted = Date()
+        var bestSNR = 0.0
+        var base: (lna: Int, vga: Int)
+        var settling = false
+        static let ladder: [(dLNA: Int, dVGA: Int, amp: Bool, note: String)] = [
+            (0, 0, false, "Adjusting gain"),
+            (0, 8, false, "Adding 8 dB of gain"),
+            (8, 8, false, "Adding 16 dB of gain"),
+            (0, 0, true, "Switching in the RF amplifier"),
+            (0, -8, true, "RF amplifier with less gain (avoids overload)"),
+        ]
+    }
+
     private init() {
         defaults.register(defaults: ["amp": false, "lna": 24, "vga": 20, "autoGain": true, "volume": 0.8])
         ampOn = defaults.bool(forKey: "amp")
@@ -92,7 +123,8 @@ final class TV: ObservableObject {
         do {
             try engine.open(rf: rf, amp: ampOn, lna: lna, vga: vga)
             deviceError = nil
-            if firstRun || channels.isEmpty { beginSetup() }
+            if firstRun || library.channels.isEmpty { beginSetup() }
+            else if !library.unavailableRFs.isEmpty, !rechecking { recheckUnavailable(then: start) }
             else if let start, !setupVisible { tune(start, showBanner: true) }
         } catch {
             deviceError = error.localizedDescription
@@ -134,6 +166,8 @@ final class TV: ObservableObject {
         engine.select(program: ch.program)
         current = ch
         hasPicture = false; format = ""; audioLayout = ""
+        tunedAt = Date(); lastFrameAt = nil; lastVideoFrames = 0; rsHist = []; weakSignal = false
+        if rescue?.rf != ch.rf { rescue = nil; rescueNote = nil }
         defaults.set(ch.id, forKey: "lastChannel")
         if showBanner { showInfo() }
     }
@@ -173,7 +207,8 @@ final class TV: ObservableObject {
     // MARK: channel list
 
     private func channelsReceived(_ list: [VirtualChannel]) {
-        guard !list.isEmpty, !scanning else { scanFound = list; return }
+        if scanning || rechecking { scanFound = list; return }
+        guard !list.isEmpty else { return }
         let snr = stats.snr_db
         library.merge(rf: engine.currentRF, found: list.map { var c = $0; c.signalDB = snr; return c })
         channels = library.visibleChannels
@@ -415,10 +450,21 @@ final class TV: ObservableObject {
     private func tick() {
         let s = engine.stats()
         stats = s
-        let moving = s.packets != lastPackets
-        lastPackets = s.packets
-        if s.state == ATSC_LOCKED, moving { if lockedAt == nil { lockedAt = Date() } } else if !scanning { lockedAt = nil }
-        hasPicture = s.state == ATSC_LOCKED && moving && !format.isEmpty
+        let m = engine.mediaStatus()
+        media = m
+        // picture present = new video frames are being decoded
+        if m.video_frames != lastVideoFrames { lastVideoFrames = m.video_frames; lastFrameAt = Date() }
+        let picture = lastFrameAt.map { Date().timeIntervalSince($0) < 1.5 } ?? false
+        hasPicture = s.state == ATSC_LOCKED && picture && !format.isEmpty
+        if s.state == ATSC_LOCKED { if lockedAt == nil { lockedAt = Date() } } else if !scanning { lockedAt = nil }
+        // packet loss over the last ~2 s
+        rsHist.append((s.rs_good + s.rs_corrected, s.rs_bad))
+        if rsHist.count > 5 { rsHist.removeFirst() }
+        if let f = rsHist.first, let l = rsHist.last {
+            let good = Double(l.good &- f.good), bad = Double(l.bad &- f.bad)
+            lossRate = good + bad > 0 ? bad / (good + bad) : (s.state == ATSC_LOCKED ? 0 : 1)
+        }
+        weakSignal = hasPicture && (lossRate > 0.02 || (s.snr_db > 0 && s.snr_db < 15.5))
 
         if let dev = engine.device, !dev.isStreaming {
             engine.closeDevice(); deviceError = "HackRF disconnected"
@@ -428,8 +474,10 @@ final class TV: ObservableObject {
             if retryTicks % 4 == 0 { openDevice() }
             return
         }
-        // automatic gain: hold the ADC level between -24 and -12 dBFS (never switches the amp on)
-        if autoGain, !scanning, s.dbfs > -60 {
+        if scanning || rechecking { return }
+        superviseReception(s, m)
+        // automatic gain (not while the rescue ladder is setting gains itself)
+        if autoGain, rescue == nil, s.dbfs > -60 {
             if s.dbfs > -12 { if vga >= 2 { vga -= 2 } else if lna >= 8 { lna -= 8 } }
             else if s.dbfs < -24 { if vga <= 60 { vga += 2 } else if lna <= 32 { lna += 8 } }
         }
@@ -437,6 +485,191 @@ final class TV: ObservableObject {
             ampOn = false
             flash("Signal very strong: RF amplifier switched off")
         }
+    }
+
+    /// Is the current channel failing because of the signal (as opposed to, say, a codec)?
+    private func signalProblem(_ s: atsc_stats) -> Bool {
+        s.state != ATSC_LOCKED || s.snr_db < 15.5 || lossRate > 0.2
+    }
+
+    /// Starts and steps the rescue ladder for the current channel when reception fails.
+    private func superviseReception(_ s: atsc_stats, _ m: atsc_media_status) {
+        guard let ch = current, !setupVisible else { return }
+        if var r = rescue {
+            if r.settling { return }
+            r.bestSNR = max(r.bestSNR, s.state == ATSC_LOCKED ? s.snr_db : 0)
+            if hasPicture && lossRate < 0.05 {
+                // this setting works: keep it for the RF channel
+                library.setGains(rf: r.rf, lna: lna, vga: vga, amp: ampOn)
+                channels = library.visibleChannels
+                flash("Reception recovered (\(Rescue.ladder[r.step].note.lowercased()))")
+                rescue = nil; rescueNote = nil
+                return
+            }
+            if Date().timeIntervalSince(r.stepStarted) < 4.5 { rescue = r; return }
+            r.step += 1
+            if r.step >= Rescue.ladder.count {
+                giveUp(ch, bestSNR: r.bestSNR)
+                return
+            }
+            applyRescueStep(&r)
+            rescue = r
+            return
+        }
+        // start a rescue when the channel will not come up, or the picture has been lost
+        let sinceTune = Date().timeIntervalSince(tunedAt)
+        let lostPicture = lastFrameAt.map { Date().timeIntervalSince($0) > 5 } ?? false
+        let noPictureYet = lastFrameAt == nil && sinceTune > 6
+        guard (noPictureYet || lostPicture), signalProblem(s) else { return }
+        // step 1 measures and sets the gain from scratch (a bad saved gain must not doom the rest)
+        var r = Rescue(rf: ch.rf, base: (lna, vga))
+        r.settling = true
+        rescue = r
+        rescueNote = "\(Rescue.ladder[0].note) (step 1 of \(Rescue.ladder.count))"
+        let rf = ch.rf
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let g = self.settleGain(target: -18, allowAmp: false)
+            DispatchQueue.main.async {
+                guard var r = self.rescue, r.rf == rf else { return }
+                r.base = (g.lna, g.vga); r.settling = false
+                self.applyRescueStep(&r)
+                self.rescue = r
+            }
+        }
+    }
+
+    private func applyRescueStep(_ r: inout Rescue) {
+        let st = Rescue.ladder[r.step]
+        lna = min(40, max(0, r.base.lna + st.dLNA))
+        vga = min(62, max(0, r.base.vga + st.dVGA))
+        if ampOn != st.amp { ampOn = st.amp }
+        r.stepStarted = Date()
+        rescueNote = "\(st.note) (step \(r.step + 1) of \(Rescue.ladder.count))"
+        engine.retune()
+    }
+
+    /// Nothing worked: take the RF channel's channels out of the list and go back.
+    private func giveUp(_ ch: VirtualChannel, bestSNR: Double) {
+        rescue = nil; rescueNote = nil
+        if ampOn { ampOn = false }
+        library.markUnavailable(rf: ch.rf, bestSNR: bestSNR)
+        channels = library.visibleChannels
+        let why = bestSNR > 0 ? String(format: "best signal quality %.1f dB, about 15 dB is needed", bestSNR)
+                              : "no usable signal"
+        flash("\(ch.number) \(ch.name) is too weak to receive right now (\(why)). It is hidden until it improves, "
+              + "you rescan, or you turn it back on in Settings > Channels.", seconds: 9)
+        if let back = previous.flatMap({ p in channels.first { $0.id == p.id } }) ?? channels.first {
+            current = nil; tune(back)
+        } else {
+            current = nil
+        }
+    }
+
+    /// At launch: quietly try channels that were marked unavailable; restore those that decode now.
+    private func recheckUnavailable(then start: VirtualChannel?) {
+        let rfs = library.unavailableRFs
+        rechecking = true
+        flash("Checking \(rfs.count == 1 ? "a weak channel" : "\(rfs.count) weak channels") again…", seconds: 20)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            var restored: [Int] = []
+            for rf in rfs {
+                for (i, useAmp) in [false, true].enumerated() {
+                    let r = self.scanOne(rf: rf, lockWait: 3, tableWait: 4, target: i == 0 ? -16 : -12, allowAmp: useAmp)
+                    if !r.list.isEmpty && (r.list.first?.signalDB ?? 0) >= 15.5 {
+                        DispatchQueue.main.sync {
+                            self.library.restore(rf: rf)
+                            if let c = r.list.first { self.library.setGains(rf: rf, lna: c.lna ?? 24, vga: c.vga ?? 20, amp: c.amp ?? false) }
+                        }
+                        restored.append(rf)
+                        break
+                    }
+                }
+            }
+            DispatchQueue.main.async {
+                self.rechecking = false
+                self.engine.device?.setAmp(self.ampOn)
+                self.channels = self.library.visibleChannels
+                self.status = nil
+                if !restored.isEmpty {
+                    let n = self.library.channels.filter { restored.contains($0.rf) }.count
+                    self.flash("Reception improved: \(n) channel\(n == 1 ? "" : "s") restored", seconds: 5)
+                }
+                if let start = start.flatMap({ s in self.channels.first { $0.id == s.id } }) ?? self.channels.first {
+                    self.current = nil; self.tune(start)
+                }
+            }
+        }
+    }
+
+    /// What the tuning screen shows: one line per stage of reception.
+    struct Stage: Identifiable {
+        enum State { case ok, working, warning, failed, pending }
+        let id: Int
+        let title: String
+        let detail: String
+        let state: State
+    }
+
+    var diagnosis: (stages: [Stage], hint: String?) {
+        let s = stats, m = media
+        let rf = current?.rf ?? engine.currentRF
+        let since = Date().timeIntervalSince(tunedAt)
+        var st: [Stage] = []
+        var hint: String?
+        func add(_ t: String, _ d: String, _ state: Stage.State) { st.append(Stage(id: st.count, title: t, detail: d, state: state)) }
+
+        // 1. the station's carrier
+        let level = String(format: "%.0f dBFS", s.dbfs)
+        if s.state == ATSC_ACQ_PILOT { add("Signal", "Listening on RF \(rf) (\(Int(RFBand.centerMHz(rf))) MHz), level \(level)", .working) }
+        else if s.pilot_snr_db < 20 {
+            add("Signal", "No ATSC signal found on RF \(rf) (level \(level))", since > 2 ? .failed : .working)
+            if since > 2 { hint = "The station's carrier is not being received. It may be off the air, or the antenna needs a better position." }
+        } else { add("Signal", String(format: "Station carrier found (%.0f dB above noise), level %@", s.pilot_snr_db, level), .ok) }
+
+        // 2. synchronisation
+        if s.state == ATSC_LOCKED { add("Sync", "Locked", .ok) }
+        else if s.state == ATSC_ACQ_PILOT { add("Sync", "Waiting", .pending) }
+        else { add("Sync", "Synchronising", since > 3 ? .failed : .working) }
+
+        // 3. signal quality
+        if s.state == ATSC_LOCKED {
+            let snr = String(format: "%.1f dB", s.snr_db)
+            let loss = lossRate > 0.001 ? String(format: ", %.0f%% of data lost", lossRate * 100) : ""
+            if s.snr_db >= 17.5 && lossRate < 0.02 { add("Quality", "SNR \(snr)\(loss)", .ok) }
+            else if s.snr_db >= 15 && lossRate < 0.2 { add("Quality", "SNR \(snr), weak\(loss)", .warning) }
+            else {
+                add("Quality", "SNR \(snr), about 15 dB is needed\(loss)", since > 3 ? .failed : .working)
+                hint = hint ?? "The signal is too weak or noisy to decode. Moving the antenna (higher, near a window) usually helps."
+            }
+        } else { add("Quality", "–", .pending) }
+
+        // 4. program tables
+        if m.program_mapped != 0 { add("Program", "Found in the broadcast", .ok) }
+        else if m.tables_seen != 0 && m.program_listed == 0 {
+            add("Program", "Channel \(current?.number ?? "") is not in this broadcast any more", .failed)
+            hint = hint ?? "The station has changed its line-up. Rescan to update the channel list."
+        } else { add("Program", s.state == ATSC_LOCKED ? "Reading channel information" : "–", s.state == ATSC_LOCKED ? .working : .pending) }
+
+        // 5. video and audio
+        if m.program_mapped != 0 {
+            let vName = m.video_type != 0 ? String(cString: atsc_stream_type_name(m.video_type)) : "none"
+            if m.video_type != 0 && m.video_supported == 0 {
+                add("Video", "\(vName) is not supported", .failed)
+                hint = hint ?? "This channel uses a video format the app cannot decode."
+            } else if m.video_type == 0 {
+                add("Video", "No video (audio-only or data service)", .warning)
+            } else if m.video_frames > 0 { add("Video", "\(vName) \(format)", .ok) }
+            else { add("Video", "\(vName): waiting for the first picture", .working) }
+            let aName = m.audio_type != 0 ? String(cString: atsc_stream_type_name(m.audio_type)) : "none"
+            if m.audio_type != 0 && m.audio_supported == 0 { add("Audio", "\(aName) is not supported", .warning) }
+            else if m.audio_frames > 0 { add("Audio", "\(aName) \(audioLayout)", .ok) }
+            else { add("Audio", m.audio_type == 0 ? "No audio" : "\(aName)", m.audio_type == 0 ? .warning : .working) }
+        } else {
+            add("Video", "–", .pending); add("Audio", "–", .pending)
+        }
+        return (st, hint)
     }
 
     /// Signal quality 0...4 bars from the equalizer SNR (15 dB is about the decoding threshold).

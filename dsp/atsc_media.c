@@ -42,7 +42,8 @@ struct atsc_media {
 
     // selected program
     int want_program, cur_program;
-    int video_pid, audio_pid;
+    int video_pid, audio_pid, video_type, audio_type;
+    uint64_t v_frames, a_frames;
     pes_buf vpes, apes;
 
     // FFmpeg
@@ -128,19 +129,21 @@ static void parse_pat(atsc_media *m, const uint8_t *s, int len) {
     select_streams(m);
 }
 
-typedef struct { int prog, video, audio, achan; } pmt_info;
+typedef struct { int prog, video, audio, vtype, atype; } pmt_info;
 static pmt_info pmts[MAX_CH]; static int npmt;       // per-media would be cleaner; one instance in practice
 
 static void parse_pmt(atsc_media *m, const uint8_t *s, int len) {
     int prog = s[3] << 8 | s[4];
     int pinfo = (s[10] & 0x0F) << 8 | s[11];
     int i = 12 + pinfo;
-    pmt_info pi = {prog, 0, 0, 0};
+    pmt_info pi = {prog, 0, 0, 0, 0};
     while (i + 5 <= len - 4) {
         int type = s[i], pid = (s[i + 1] & 0x1F) << 8 | s[i + 2];
         int eslen = (s[i + 3] & 0x0F) << 8 | s[i + 4];
-        if ((type == 0x02 || type == 0x01) && !pi.video) pi.video = pid;
-        if ((type == 0x81 || type == 0x87) && !pi.audio) pi.audio = pid;
+        int is_video = type == 0x01 || type == 0x02 || type == 0x1B || type == 0x24;
+        int is_audio = type == 0x81 || type == 0x87 || type == 0x0F || type == 0x11 || type == 0x03 || type == 0x04;
+        if (is_video && !pi.video) { pi.video = pid; pi.vtype = type; }
+        if (is_audio && !pi.audio) { pi.audio = pid; pi.atype = type; }
         i += 5 + eslen;
     }
     int k = 0;
@@ -273,19 +276,43 @@ static void close_decoders(atsc_media *m) {
     m->a_next_pts = m->v_next_pts = AV_NOPTS_VALUE; m->v_frame_dur = 0;
 }
 
+static enum AVCodecID video_codec(int t) {
+    switch (t) { case 0x01: case 0x02: return AV_CODEC_ID_MPEG2VIDEO; case 0x1B: return AV_CODEC_ID_H264; case 0x24: return AV_CODEC_ID_HEVC; default: return AV_CODEC_ID_NONE; }
+}
+static enum AVCodecID audio_codec(int t) {
+    switch (t) {
+    case 0x81: return AV_CODEC_ID_AC3; case 0x87: return AV_CODEC_ID_EAC3;
+    case 0x0F: return AV_CODEC_ID_AAC; case 0x11: return AV_CODEC_ID_AAC_LATM;
+    case 0x03: case 0x04: return AV_CODEC_ID_MP2;
+    default: return AV_CODEC_ID_NONE;
+    }
+}
+
+const char *atsc_stream_type_name(int t) {
+    switch (t) {
+    case 0x01: return "MPEG-1"; case 0x02: return "MPEG-2"; case 0x1B: return "H.264"; case 0x24: return "H.265";
+    case 0x81: return "AC-3"; case 0x87: return "E-AC-3"; case 0x0F: return "AAC"; case 0x11: return "AAC (LATM)";
+    case 0x03: case 0x04: return "MPEG audio";
+    default: return "unknown";
+    }
+}
+
+static AVCodecContext *open_one(enum AVCodecID id, AVCodecParserContext **parser, int threads) {
+    const AVCodec *c = id == AV_CODEC_ID_NONE ? NULL : avcodec_find_decoder(id);
+    if (!c) { *parser = NULL; return NULL; }
+    AVCodecContext *ctx = avcodec_alloc_context3(c);
+    ctx->thread_count = threads;
+    ctx->pkt_timebase = (AVRational){1, 90000};
+    if (avcodec_open2(ctx, c, NULL) < 0) { avcodec_free_context(&ctx); *parser = NULL; return NULL; }
+    *parser = av_parser_init(id == AV_CODEC_ID_MP2 ? AV_CODEC_ID_MP2 : id);
+    return ctx;
+}
+
 static void open_decoders(atsc_media *m) {
     close_decoders(m);
-    const AVCodec *vc = avcodec_find_decoder(AV_CODEC_ID_MPEG2VIDEO);
-    const AVCodec *ac = avcodec_find_decoder(AV_CODEC_ID_AC3);
-    m->vdec = avcodec_alloc_context3(vc);
-    m->vdec->thread_count = 4;
-    m->vdec->pkt_timebase = (AVRational){1, 90000};
-    avcodec_open2(m->vdec, vc, NULL);
-    m->adec = avcodec_alloc_context3(ac);
-    m->adec->pkt_timebase = (AVRational){1, 90000};
-    avcodec_open2(m->adec, ac, NULL);
-    m->vparser = av_parser_init(AV_CODEC_ID_MPEG2VIDEO);
-    m->aparser = av_parser_init(AV_CODEC_ID_AC3);
+    m->vdec = open_one(video_codec(m->video_type), &m->vparser, 4);
+    m->adec = open_one(audio_codec(m->audio_type), &m->aparser, 1);
+    m->v_frames = m->a_frames = 0;
 }
 
 static void select_streams(atsc_media *m) {
@@ -296,6 +323,7 @@ static void select_streams(atsc_media *m) {
         if (prog == m->cur_program && pmts[k].video == m->video_pid && pmts[k].audio == m->audio_pid) return;
         m->cur_program = prog;
         m->video_pid = pmts[k].video; m->audio_pid = pmts[k].audio;
+        m->video_type = pmts[k].vtype; m->audio_type = pmts[k].atype;
         open_decoders(m);
         return;
     }
@@ -322,6 +350,7 @@ static int build_graph(atsc_media *m, AVFrame *f) {
 }
 
 static void emit_video(atsc_media *m, AVFrame *f) {
+    m->v_frames++;
     if (m->cb.video)
         m->cb.video(m->cb.ctx, f->data[0], f->data[1], f->data[2], f->linesize[0], f->linesize[1],
                     f->width, f->height, f->sample_aspect_ratio.num ? f->sample_aspect_ratio.num : 1,
@@ -386,6 +415,7 @@ static void decode_audio(atsc_media *m, AVPacket *pk) {
         if (pts == AV_NOPTS_VALUE || (m->a_next_pts != AV_NOPTS_VALUE && llabs(pts - m->a_next_pts) < 900))
             pts = m->a_next_pts;                       // also smooths sub-10 ms timestamp jitter
         if (pts != AV_NOPTS_VALUE) m->a_next_pts = pts + (int64_t)got * 90000 / f->sample_rate;
+        if (got > 0) m->a_frames++;
         if (got > 0 && pts != AV_NOPTS_VALUE && m->cb.audio) m->cb.audio(m->cb.ctx, m->abuf, got, f->sample_rate, pts);
         av_frame_unref(f);
     }
@@ -459,6 +489,21 @@ void atsc_media_reset(atsc_media *m) {
     m->pat_version = m->tvct_version = -1;
     m->nprog = 0; m->nch = 0; npmt = 0;
     m->cur_program = -1; m->video_pid = m->audio_pid = -1;
+    m->video_type = m->audio_type = 0; m->v_frames = m->a_frames = 0;
+}
+
+void atsc_media_get_status(atsc_media *m, atsc_media_status *o) {
+    memset(o, 0, sizeof *o);
+    o->tables_seen = m->pat_version >= 0;
+    int want = m->want_program;
+    for (int k = 0; k < m->nprog; k++) if (m->prog_list[k] == want || (!want && k == 0)) o->program_listed = 1;
+    o->program_mapped = m->cur_program > 0 && (!want || m->cur_program == want);
+    o->video_type = o->program_mapped ? m->video_type : 0;
+    o->audio_type = o->program_mapped ? m->audio_type : 0;
+    o->video_supported = m->vdec != NULL;
+    o->audio_supported = m->adec != NULL;
+    o->video_frames = m->v_frames; o->audio_frames = m->a_frames;
+    o->dropped_packets = m->dropped;
 }
 
 int atsc_media_selected_pids(atsc_media *m, int *pids, int max) {

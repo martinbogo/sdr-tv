@@ -133,6 +133,12 @@ final class Engine {
         player.flush()
     }
 
+    func mediaStatus() -> atsc_media_status {
+        var s = atsc_media_status()
+        if let media { atsc_media_get_status(media, &s) }
+        return s
+    }
+
     func stats() -> atsc_stats {
         var s = atsc_stats()
         if let rx { atsc_rx_get_stats(rx, &s) }
