@@ -44,7 +44,7 @@ struct TVCommands: Commands {
             Button("Show Info") { tv.toggleInfo() }.keyboardShortcut("i", modifiers: .command)
             Divider()
             Menu("Go to Channel") {
-                ForEach(tv.channels) { ch in Button("\(ch.number)  \(ch.name)") { tv.tune(ch) } }
+                ForEach(tv.channels) { ch in Button("\(ch.number)  \(ch.name)\(ch.isUnavailable ? "  (weak)" : "")") { tv.tune(ch) } }
             }
             Divider()
             Button("Scan for Channels…") { tv.beginSetup() }.disabled(tv.scanning)
@@ -53,6 +53,17 @@ struct TVCommands: Commands {
             Button("Volume Up") { tv.changeVolume(0.05) }.keyboardShortcut(.rightArrow, modifiers: .command)
             Button("Volume Down") { tv.changeVolume(-0.05) }.keyboardShortcut(.leftArrow, modifiers: .command)
             Button(tv.muted ? "Unmute" : "Mute") { tv.toggleMute() }.keyboardShortcut("m", modifiers: [.command, .shift])
+            Divider()
+            Menu("Captions") {
+                Button("Off") { tv.selectCaptions(nil) }
+                ForEach(tv.captionChoices) { c in Button(c.label) { tv.selectCaptions(c) } }
+            }
+            Button("Next Caption Setting") { tv.cycleCaptions() }.keyboardShortcut("c", modifiers: [.command, .shift])
+            Menu("Audio Track") {
+                ForEach(Array(tv.audioTracks.enumerated()), id: \.offset) { i, t in Button(tv.label(for: t)) { tv.selectAudio(i) } }
+            }
+            .disabled(tv.audioTracks.isEmpty)
+            Button("Next Audio Track") { tv.cycleAudio() }.keyboardShortcut("a", modifiers: [.command, .shift])
         }
     }
 }

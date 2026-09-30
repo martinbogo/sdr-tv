@@ -43,6 +43,8 @@ typedef struct {
     void (*event)(void *ctx, const atsc_event *ev);
     /// Broadcast clock from the System Time Table, Unix seconds.
     void (*time)(void *ctx, int64_t utc);
+    /// Caption screen changed (JSON, see atsc_captions.h), to be shown at video time `pts`.
+    void (*captions)(void *ctx, int64_t pts, const char *json);
     /// Format of the selected program's streams.
     void (*format)(void *ctx, int width, int height, int interlaced, int audio_channels);
 } atsc_media_cb;
@@ -71,6 +73,30 @@ void atsc_media_get_status(atsc_media *m, atsc_media_status *out);
 
 /// Human-readable codec name for an MPEG stream_type ("MPEG-2", "H.264", "AC-3", ...).
 const char *atsc_stream_type_name(int stream_type);
+
+/// One audio stream of the selected program.
+typedef struct {
+    int pid, stream_type;
+    char lang[4];                // ISO 639-2 code, "" if not signalled
+    int role;                    // 0 main, 1 music/effects, 2 visually impaired (description),
+                                 // 3 hearing impaired, 4 dialogue, 5 commentary, 6 emergency
+    int channels;                // from the AC-3 descriptor, 0 if unknown
+} atsc_audio_track;
+
+/// One caption service announced by the broadcaster (caption_service_descriptor).
+typedef struct {
+    char lang[4];
+    int digital;                 // 1: CEA-708 service `number`; 0: CEA-608 on field `number` (1 or 2)
+    int number;
+    int easy_reader, wide;
+} atsc_caption_service;
+
+int atsc_media_audio_tracks(atsc_media *m, atsc_audio_track *out, int max);
+/// Choose the audio stream by index in the list above.
+void atsc_media_select_audio(atsc_media *m, int index);
+int atsc_media_caption_services(atsc_media *m, atsc_caption_service *out, int max);
+/// 0 off, 1..4 CC1..CC4 (608), 101..163 708 service 1..63.
+void atsc_media_select_captions(atsc_media *m, int service);
 
 /// PIDs needed to record the selected program (PAT, its PMT, video, audio, PSIP). Returns count.
 int atsc_media_selected_pids(atsc_media *m, int *pids, int max);

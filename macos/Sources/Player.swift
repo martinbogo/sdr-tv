@@ -24,12 +24,17 @@ final class Player {
     /// Display aspect ratio (width / height) of the picture, reported once it has been stable
     /// for ~15 frames so a stray frame cannot make the picture jump. Called on the main thread.
     var onAspect: ((CGFloat) -> Void)?
+
+    /// Caption screens (JSON) queued with their video time; shown when playback reaches them.
+    var onCaption: ((String) -> Void)?
+    private var captionQueue: [(pts: Int64, json: String)] = []
+    private var captionTimer: Timer?
     private var shownAspect: CGFloat = 16.0 / 9.0
     private var candidateAspect: CGFloat = 0
     private var candidateCount = 0
     private var fmtDesc: CMVideoFormatDescription?
     /// How far behind the live broadcast playback runs, to absorb decode and delivery jitter.
-    let latency: Int64 = 45_000                 // 0.5 s in 90 kHz ticks
+    let latency: Int64 = 72_000                 // 0.8 s in 90 kHz ticks
 
     init() {
         layer.videoGravity = .resize             // the view sizes the layer to the right shape
@@ -59,6 +64,8 @@ final class Player {
         wrapBase = [0, 0]
         candidateCount = 0
         fmtDesc = nil
+        captionQueue.removeAll()
+        DispatchQueue.main.async { [weak self] in self?.onCaption?("{\"regions\":[]}") }
         pendingSince = nil
     }
 
@@ -100,6 +107,44 @@ final class Player {
         if lead > 4 * 90_000 || lead < -90_000 {
             sync.setRate(1, time: CMTime(value: latestPTS - latency, timescale: 90_000))
         }
+    }
+
+    // MARK: captions
+
+    /// Called on the media thread with the video PTS of the frame the caption change belongs to.
+    func caption(json: String, pts raw: Int64) {
+        lock.lock(); defer { lock.unlock() }
+        guard raw != Int64.min else { return }
+        // map into the video stream's unwrapped timeline without disturbing its wrap state
+        let period: Int64 = 1 << 33
+        var t = (raw & (period - 1)) + wrapBase[0]
+        if let last = lastRaw[0] {
+            let lastT = last + wrapBase[0]
+            if t - lastT > period / 2 { t -= period } else if lastT - t > period / 2 { t += period }
+        }
+        captionQueue.append((t, json))
+        if captionQueue.count > 400 { captionQueue.removeFirst(captionQueue.count - 400) }
+        if captionTimer == nil {
+            DispatchQueue.main.async { [weak self] in self?.startCaptionClock() }
+        }
+    }
+
+    private func startCaptionClock() {
+        guard captionTimer == nil else { return }
+        captionTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] _ in self?.releaseCaptions() }
+    }
+
+    private func releaseCaptions() {
+        lock.lock()
+        guard started else { lock.unlock(); return }
+        let now = Int64(sync.currentTime().seconds * 90_000)
+        var due: String?
+        while let first = captionQueue.first, first.pts <= now {
+            due = first.json
+            captionQueue.removeFirst()
+        }
+        lock.unlock()
+        if let due { onCaption?(due) }
     }
 
     // MARK: video

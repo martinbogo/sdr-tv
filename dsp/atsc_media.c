@@ -1,5 +1,6 @@
 // ATSC transport stream demultiplexer, PSIP parser (A/65) and decoder (FFmpeg: MPEG-2, AC-3).
 #include "atsc_media.h"
+#include "atsc_captions.h"
 
 #include <libavcodec/avcodec.h>
 #include <libavfilter/avfilter.h>
@@ -43,6 +44,8 @@ struct atsc_media {
     // selected program
     int want_program, cur_program;
     int video_pid, audio_pid, video_type, audio_type;
+    int want_audio, cur_pmt;
+    cc_decoder *cc; int cc_service; int64_t cc_pts;
     uint64_t v_frames, a_frames;
     pes_buf vpes, apes;
 
@@ -129,23 +132,54 @@ static void parse_pat(atsc_media *m, const uint8_t *s, int len) {
     select_streams(m);
 }
 
-typedef struct { int prog, video, audio, vtype, atype; } pmt_info;
+#define MAX_AUD 8
+#define MAX_CCS 16
+typedef struct {
+    int prog, video, audio, vtype, atype;
+    atsc_audio_track aud[MAX_AUD]; int naud;
+    atsc_caption_service ccs[MAX_CCS]; int nccs;
+} pmt_info;
 static pmt_info pmts[MAX_CH]; static int npmt;       // per-media would be cleaner; one instance in practice
 
 static void parse_pmt(atsc_media *m, const uint8_t *s, int len) {
     int prog = s[3] << 8 | s[4];
     int pinfo = (s[10] & 0x0F) << 8 | s[11];
     int i = 12 + pinfo;
-    pmt_info pi = {prog, 0, 0, 0, 0};
+    pmt_info pi; memset(&pi, 0, sizeof pi); pi.prog = prog;
     while (i + 5 <= len - 4) {
         int type = s[i], pid = (s[i + 1] & 0x1F) << 8 | s[i + 2];
         int eslen = (s[i + 3] & 0x0F) << 8 | s[i + 4];
+        const uint8_t *d = s + i + 5, *dend = s + i + 5 + eslen;
+        if (dend > s + len - 4) dend = s + len - 4;
         int is_video = type == 0x01 || type == 0x02 || type == 0x1B || type == 0x24;
         int is_audio = type == 0x81 || type == 0x87 || type == 0x0F || type == 0x11 || type == 0x03 || type == 0x04;
         if (is_video && !pi.video) { pi.video = pid; pi.vtype = type; }
-        if (is_audio && !pi.audio) { pi.audio = pid; pi.atype = type; }
+        atsc_audio_track at; memset(&at, 0, sizeof at); at.pid = pid; at.stream_type = type;
+        for (const uint8_t *q = d; q + 2 <= dend && q + 2 + q[1] <= dend; q += 2 + q[1]) {
+            int tag = q[0], dl = q[1]; const uint8_t *v = q + 2;
+            if (tag == 0x0A && dl >= 4 && is_audio) {             // ISO 639 language
+                memcpy(at.lang, v, 3); at.lang[3] = 0;
+                if (v[3] == 3) at.role = 3; else if (v[3] == 2 && !at.role) at.role = 2;
+            } else if (tag == 0x81 && dl >= 3 && is_audio) {      // ATSC AC-3 audio descriptor
+                int bsmod = v[2] >> 5, nch = (v[2] >> 1) & 0x0F;
+                if (bsmod) at.role = bsmod;
+                static const int chmap[8] = {2, 1, 2, 3, 3, 4, 4, 5};
+                at.channels = nch < 8 ? chmap[nch] : (nch == 8 ? 1 : nch == 9 ? 2 : nch == 10 ? 6 : 0);
+            } else if (tag == 0x86 && dl >= 1) {                  // caption service descriptor
+                int ns = v[0] & 0x1F; const uint8_t *e = v + 1;
+                for (int k = 0; k < ns && e + 6 <= v + dl && pi.nccs < MAX_CCS; k++, e += 6) {
+                    atsc_caption_service *c = &pi.ccs[pi.nccs++];
+                    memcpy(c->lang, e, 3); c->lang[3] = 0;
+                    c->digital = (e[3] >> 7) & 1;
+                    c->number = c->digital ? (e[3] & 0x3F) : (e[3] & 1) + 1;
+                    c->easy_reader = (e[4] >> 7) & 1; c->wide = (e[4] >> 6) & 1;
+                }
+            }
+        }
+        if (is_audio && pi.naud < MAX_AUD) pi.aud[pi.naud++] = at;
         i += 5 + eslen;
     }
+    if (pi.naud) { pi.audio = pi.aud[0].pid; pi.atype = pi.aud[0].stream_type; }
     int k = 0;
     for (; k < npmt; k++) if (pmts[k].prog == prog) break;
     if (k == npmt && npmt < MAX_CH) npmt++;
@@ -320,13 +354,56 @@ static void select_streams(atsc_media *m) {
     if (!prog && m->nprog) prog = m->prog_list[0];
     for (int k = 0; k < npmt; k++) {
         if (pmts[k].prog != prog) continue;
-        if (prog == m->cur_program && pmts[k].video == m->video_pid && pmts[k].audio == m->audio_pid) return;
-        m->cur_program = prog;
-        m->video_pid = pmts[k].video; m->audio_pid = pmts[k].audio;
-        m->video_type = pmts[k].vtype; m->audio_type = pmts[k].atype;
-        open_decoders(m);
+        pmt_info *pi = &pmts[k];
+        int ai = m->want_audio >= 0 && m->want_audio < pi->naud ? m->want_audio : 0;
+        int apid = pi->naud ? pi->aud[ai].pid : 0, atype = pi->naud ? pi->aud[ai].stream_type : 0;
+        if (prog == m->cur_program && pi->video == m->video_pid && apid == m->audio_pid) { m->cur_pmt = k; return; }
+        int video_same = prog == m->cur_program && pi->video == m->video_pid;
+        m->cur_program = prog; m->cur_pmt = k;
+        m->video_pid = pi->video; m->video_type = pi->vtype;
+        m->audio_pid = apid; m->audio_type = atype;
+        if (video_same) {                          // audio track change only: keep the picture going
+            if (m->aparser) av_parser_close(m->aparser);
+            avcodec_free_context(&m->adec);
+            m->adec = open_one(audio_codec(atype), &m->aparser, 1);
+            swr_free(&m->swr); m->swr_in_ch = 0; m->apes.started = 0; m->a_next_pts = AV_NOPTS_VALUE;
+        } else {
+            open_decoders(m);
+            if (m->cc) cc_reset(m->cc);
+        }
         return;
     }
+}
+
+int atsc_media_audio_tracks(atsc_media *m, atsc_audio_track *out, int max) {
+    if (m->cur_pmt < 0 || m->cur_pmt >= npmt) return 0;
+    pmt_info *pi = &pmts[m->cur_pmt];
+    int n = pi->naud < max ? pi->naud : max;
+    memcpy(out, pi->aud, sizeof(atsc_audio_track) * n);
+    return n;
+}
+
+void atsc_media_select_audio(atsc_media *m, int index) { m->want_audio = index; select_streams(m); }
+
+int atsc_media_caption_services(atsc_media *m, atsc_caption_service *out, int max) {
+    if (m->cur_pmt < 0 || m->cur_pmt >= npmt) return 0;
+    pmt_info *pi = &pmts[m->cur_pmt];
+    int n = pi->nccs < max ? pi->nccs : max;
+    memcpy(out, pi->ccs, sizeof(atsc_caption_service) * n);
+    return n;
+}
+
+static void on_cc_screen(void *ctx, const char *json) {
+    atsc_media *m = ctx;
+    if (m->cb.captions) m->cb.captions(m->cb.ctx, m->cc_pts, json);
+}
+
+void atsc_media_select_captions(atsc_media *m, int service) {
+    if (service == m->cc_service) return;
+    m->cc_service = service;
+    cc_destroy(m->cc); m->cc = NULL;
+    if (service) m->cc = cc_create(service, on_cc_screen, m);
+    else if (m->cb.captions) m->cb.captions(m->cb.ctx, m->cc_pts, "{\"regions\":[]}");
 }
 
 static int build_graph(atsc_media *m, AVFrame *f) {
@@ -370,6 +447,10 @@ static void decode_video(atsc_media *m, AVPacket *pk) {
         if (m->fmt_w != f->width || m->fmt_h != f->height || m->fmt_i != interlaced) {
             m->fmt_w = f->width; m->fmt_h = f->height; m->fmt_i = interlaced;
             if (m->cb.format) m->cb.format(m->cb.ctx, f->width, f->height, interlaced, m->fmt_ach);
+        }
+        if (m->cc) {
+            AVFrameSideData *sd = av_frame_get_side_data(f, AV_FRAME_DATA_A53_CC);
+            if (sd && sd->size >= 3) { m->cc_pts = f->pts; cc_feed(m->cc, sd->data, (int)(sd->size / 3)); }
         }
         AVRational sar = f->sample_aspect_ratio.num ? f->sample_aspect_ratio : (AVRational){1, 1};
         if (!m->graph || f->width != m->g_w || f->height != m->g_h || f->format != m->g_fmt ||
@@ -474,6 +555,7 @@ atsc_media *atsc_media_create(const atsc_media_cb *cb) {
 
 void atsc_media_destroy(atsc_media *m) {
     if (!m) return;
+    cc_destroy(m->cc);
     close_decoders(m);
     for (int i = 0; i < MAX_PIDS; i++) free(m->sec[i]);
     av_frame_free(&m->frame); av_frame_free(&m->filt); av_packet_free(&m->pkt);
@@ -490,6 +572,8 @@ void atsc_media_reset(atsc_media *m) {
     m->nprog = 0; m->nch = 0; npmt = 0;
     m->cur_program = -1; m->video_pid = m->audio_pid = -1;
     m->video_type = m->audio_type = 0; m->v_frames = m->a_frames = 0;
+    m->cur_pmt = -1; m->want_audio = 0;
+    if (m->cc) cc_reset(m->cc);
 }
 
 void atsc_media_get_status(atsc_media *m, atsc_media_status *o) {
@@ -517,6 +601,7 @@ int atsc_media_selected_pids(atsc_media *m, int *pids, int max) {
 int atsc_media_current_program(atsc_media *m) { return m->cur_program; }
 
 void atsc_media_select(atsc_media *m, int program) {
+    if (program != m->want_program) m->want_audio = 0;
     m->want_program = program;
     select_streams(m);
 }

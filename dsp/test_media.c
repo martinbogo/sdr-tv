@@ -58,7 +58,7 @@ static void on_format(void *c, int w, int h, int il, int ach) {
 
 int main(int argc, char **argv) {
     outpath = argv[3];
-    atsc_media_cb cb = {NULL, on_video, on_audio, on_channels, on_event, on_time, on_format};
+    atsc_media_cb cb = {0}; cb.video = on_video; cb.audio = on_audio; cb.channels = on_channels; cb.event = on_event; cb.time = on_time; cb.format = on_format;
     atsc_media *m = atsc_media_create(&cb);
     atsc_media_select(m, atoi(argv[2]));
     FILE *f = fopen(argv[1], "rb");

@@ -53,6 +53,7 @@ struct TVScreen: View {
             Color.black
             VideoSurface(layer: tv.engine.player.layer, aspect: tv.aspect)
                 .opacity(tv.hasPicture && !tv.scanning && !tv.setupVisible ? 1 : 0)
+            if tv.hasPicture, tv.captionService != 0, !tv.guideVisible { CaptionOverlay() }
             idleMessage
             VStack(spacing: 0) {
                 HStack(alignment: .top) {
@@ -126,6 +127,8 @@ struct TVScreen: View {
             case "g": tv.guideVisible = true
             case "i": tv.toggleInfo()
             case "m": tv.toggleMute()
+            case "c": tv.cycleCaptions()
+            case "a": tv.cycleAudio()
             case "l": tv.recall()
             case "r": tv.toggleRecording()
             case "f": NSApp.keyWindow?.toggleFullScreen(nil)
@@ -203,6 +206,8 @@ struct ChannelBanner: View {
                         if !tv.videoCodec.isEmpty { Badge(tv.videoCodec) }
                         if !tv.format.isEmpty { Badge(tv.format) }
                         if !tv.audioLayout.isEmpty { Badge(tv.audioLayout) }
+                        if tv.audioTracks.count > 1 { Badge("\(tv.audioTracks.count) audio") }
+                        if tv.captionService != 0 { Badge("CC") }
                         SignalBars(bars: tv.bars)
                     }
                     Text("RF \(ch?.rf ?? 0)").font(.caption).foregroundStyle(.secondary)
@@ -288,7 +293,7 @@ struct ControlBar: View {
         HStack(spacing: 18) {
             Button { tv.step(-1) } label: { Image(systemName: "chevron.down") }.help("Previous channel (↓)")
             Menu {
-                ForEach(tv.channels) { ch in Button("\(ch.number)  \(ch.name)") { tv.tune(ch) } }
+                ForEach(tv.channels) { ch in Button("\(ch.number)  \(ch.name)\(ch.isUnavailable ? "  (weak)" : "")") { tv.tune(ch) } }
             } label: {
                 Text(tv.current.map { "\($0.number)  \($0.name)" } ?? "Channels").monospacedDigit()
             }
@@ -301,6 +306,24 @@ struct ControlBar: View {
             Button { tv.toggleMute() } label: { Image(systemName: tv.muted ? "speaker.slash.fill" : "speaker.wave.2.fill") }
                 .help("Mute (M)")
             Slider(value: Binding(get: { tv.volume }, set: { tv.volume = $0; tv.muted = false }), in: 0...1).frame(width: 110)
+            Divider().frame(height: 18)
+            Menu {
+                Button { tv.selectCaptions(nil) } label: { choiceLabel("Off", tv.captionService == 0) }
+                ForEach(tv.captionChoices) { c in
+                    Button { tv.selectCaptions(c) } label: { choiceLabel(c.label, tv.captionService == c.service) }
+                }
+            } label: {
+                Image(systemName: tv.captionService == 0 ? "captions.bubble" : "captions.bubble.fill")
+            }
+            .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().help("Captions (C)")
+            if tv.audioTracks.count > 1 {
+                Menu {
+                    ForEach(Array(tv.audioTracks.enumerated()), id: \.offset) { i, t in
+                        Button { tv.selectAudio(i) } label: { choiceLabel(tv.label(for: t), i == tv.audioIndex) }
+                    }
+                } label: { Image(systemName: "waveform.badge.plus") }
+                .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().help("Audio track (A)")
+            }
             Divider().frame(height: 18)
             Button { tv.toggleRecording() } label: {
                 Image(systemName: tv.recordingSince == nil ? "record.circle" : "stop.circle.fill")
@@ -317,6 +340,10 @@ struct ControlBar: View {
         .environment(\.colorScheme, .dark)
         .padding(.top, 12)
     }
+}
+
+@ViewBuilder func choiceLabel(_ text: String, _ selected: Bool) -> some View {
+    if selected { Label(text, systemImage: "checkmark") } else { Text(text) }
 }
 
 // MARK: - guide
@@ -421,6 +448,7 @@ struct GuideRow: View {
                 Text(ch.number).font(.headline).monospacedDigit().frame(width: 52, alignment: .leading)
                 Text(ch.name).font(.headline.weight(.regular)).lineLimit(1)
                 if current { Image(systemName: "play.fill").font(.caption).foregroundStyle(.secondary) }
+                if ch.isUnavailable { Image(systemName: "antenna.radiowaves.left.and.right.slash").font(.caption).foregroundStyle(.orange).help("Weak signal last time") }
             }
             .frame(width: chWidth, alignment: .leading)
             ZStack(alignment: .leading) {
@@ -444,6 +472,7 @@ struct GuideRow: View {
             .clipped()
         }
         .padding(.vertical, 3)
+        .opacity(ch.isUnavailable && !selected ? 0.55 : 1)
         .background(RoundedRectangle(cornerRadius: 8).fill(selected ? Color.accentColor.opacity(0.45) : Color.clear))
     }
 }
@@ -455,6 +484,7 @@ struct SettingsView: View {
         TabView {
             TunerSettings().tabItem { Label("Tuner", systemImage: "antenna.radiowaves.left.and.right") }
             ChannelSettings().tabItem { Label("Channels", systemImage: "list.number") }
+            AccessibilitySettings().tabItem { Label("Captions & Audio", systemImage: "captions.bubble") }
             RecordingSettings().tabItem { Label("Recording", systemImage: "record.circle") }
         }
         .frame(width: 520, height: 460)
@@ -515,9 +545,9 @@ struct ChannelSettings: View {
             }
             Table(tv.allChannels) {
                 TableColumn("Show") { ch in
-                    Toggle("", isOn: Binding(get: { !ch.hidden && !ch.isUnavailable }, set: { tv.setHidden(ch, !$0) }))
+                    Toggle("", isOn: Binding(get: { !ch.hidden }, set: { tv.setHidden(ch, !$0) }))
                         .labelsHidden()
-                        .help(ch.isUnavailable ? "Hidden because it was too weak to receive. Turn on to try it again." : "")
+                        .help("Unchecked channels are removed from the channel list, guide and menus until you check them again.")
                 }
                 .width(40)
                 TableColumn("Channel") { ch in Text(ch.number).monospacedDigit() }.width(64)
@@ -525,7 +555,7 @@ struct ChannelSettings: View {
                 TableColumn("RF") { ch in Text("\(ch.rf)").monospacedDigit() }.width(36)
                 TableColumn("Signal") { ch in
                     if ch.isUnavailable {
-                        Text("Too weak").foregroundStyle(.orange)
+                        Text("Weak").foregroundStyle(.orange).help("Too weak last time it was tuned; choosing it retries.")
                     } else {
                         Text(ch.signalDB > 0 ? String(format: "%.0f dB", ch.signalDB) : "–").monospacedDigit()
                     }
@@ -694,5 +724,97 @@ struct WeakSignalOSD: View {
         .foregroundStyle(.white)
         .padding(.horizontal, 12).padding(.vertical, 6)
         .background(.black.opacity(0.55), in: Capsule())
+    }
+}
+
+// MARK: - captions
+
+/// Draws the decoder's caption screen over the picture, inside the caption-safe area (the
+/// central 80% of the picture) with the positions and anchoring the broadcaster specified.
+struct CaptionOverlay: View {
+    @EnvironmentObject var tv: TV
+
+    var body: some View {
+        GeometryReader { g in
+            let pic = pictureRect(g.size)
+            let safe = pic.insetBy(dx: pic.width * 0.1, dy: pic.height * 0.1)
+            let row = safe.height / 15
+            let fs = max(10, row * 0.8 * tv.captionScale)
+            ZStack(alignment: .topLeading) {
+                ForEach(Array(tv.captionRegions.enumerated()), id: \.offset) { _, r in
+                    Color.clear.frame(width: 0, height: 0)
+                        .overlay(alignment: alignment(r.anchor)) {
+                            VStack(alignment: hAlign(r.anchor), spacing: 0) {
+                                ForEach(Array(r.lines.enumerated()), id: \.offset) { _, line in
+                                    Text(line.isEmpty ? " " : line)
+                                        .font(.system(size: fs, weight: .medium, design: .monospaced))
+                                        .foregroundStyle(.white)
+                                        .padding(.horizontal, fs * 0.25)
+                                        .frame(minHeight: row * tv.captionScale)
+                                        .background(Color.black.opacity(line.trimmingCharacters(in: .whitespaces).isEmpty ? 0 : tv.captionBackground))
+                                        .fixedSize()
+                                }
+                            }
+                        }
+                        .position(x: safe.minX + CGFloat(r.x) * safe.width, y: safe.minY + CGFloat(r.y) * safe.height)
+                }
+            }
+        }
+        .allowsHitTesting(false)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(tv.captionRegions.flatMap(\.lines).joined(separator: " "))
+    }
+
+    private func pictureRect(_ size: CGSize) -> CGRect {
+        var w = size.width, h = w / tv.aspect
+        if h > size.height { h = size.height; w = h * tv.aspect }
+        return CGRect(x: (size.width - w) / 2, y: (size.height - h) / 2, width: w, height: h)
+    }
+
+    private func alignment(_ a: Int) -> Alignment {
+        [.topLeading, .top, .topTrailing, .leading, .center, .trailing, .bottomLeading, .bottom, .bottomTrailing][min(max(a, 0), 8)]
+    }
+
+    private func hAlign(_ a: Int) -> HorizontalAlignment {
+        switch a % 3 { case 1: return .center; case 2: return .trailing; default: return .leading }
+    }
+}
+
+struct AccessibilitySettings: View {
+    @EnvironmentObject var tv: TV
+    private let languages = ["eng", "spa", "fra", "por", "deu", "ita", "zho", "kor", "vie", "tgl", "rus", "ara", "jpn"]
+
+    var body: some View {
+        Form {
+            Section {
+                Toggle("Show captions", isOn: $tv.captionsOn)
+                Picker("Preferred caption language", selection: $tv.captionLanguage) {
+                    ForEach(languages, id: \.self) { Text(TV.languageName($0)).tag($0) }
+                }
+                Picker("Text size", selection: $tv.captionScale) {
+                    Text("Small").tag(0.8); Text("Medium").tag(1.0); Text("Large").tag(1.3); Text("Extra large").tag(1.6)
+                }
+                LabeledContent("Background") {
+                    Slider(value: $tv.captionBackground, in: 0...1)
+                }
+            } header: {
+                Text("Closed captions")
+            } footer: {
+                Text("Digital (CEA-708) captions are used when the station provides them in your language, otherwise analog-compatible (CEA-608) captions. Press C to switch captions while watching.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section {
+                Picker("Preferred audio language", selection: $tv.audioLanguage) {
+                    ForEach(languages, id: \.self) { Text(TV.languageName($0)).tag($0) }
+                }
+                Toggle("Prefer audio description when available", isOn: $tv.preferDescription)
+            } header: {
+                Text("Audio")
+            } footer: {
+                Text("Audio description narrates what is on screen for blind and low-vision viewers. Press A to switch audio tracks while watching.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
     }
 }

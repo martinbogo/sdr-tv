@@ -20,6 +20,18 @@ final class Engine {
     private let cmdLock = NSLock()
     private var cmdReset = false
     private var cmdProgram: Int?
+    private var cmdAudio: Int?
+    private var cmdCaptions: Int?
+
+    /// Audio tracks and caption services of the selected program, refreshed by the media thread.
+    struct ProgramInfo: Equatable {
+        var audio: [AudioTrack] = []
+        var captions: [CaptionService] = []
+    }
+    struct AudioTrack: Equatable { var pid: Int; var codec: String; var lang: String; var role: Int; var channels: Int }
+    struct CaptionService: Equatable { var lang: String; var digital: Bool; var number: Int; var easyReader: Bool }
+    var onProgramInfo: ((ProgramInfo) -> Void)?
+    private var lastInfo = ProgramInfo()
 
     // retune requests for the DSP thread
     private let tuneLock = NSLock()
@@ -87,6 +99,10 @@ final class Engine {
             let e = Unmanaged<Engine>.fromOpaque(ctx).takeUnretainedValue()
             DispatchQueue.main.async { e.onClock?(Date(timeIntervalSince1970: TimeInterval(utc))) }
         }
+        cb.captions = { ctx, pts, json in
+            guard let ctx, let json else { return }
+            Unmanaged<Engine>.fromOpaque(ctx).takeUnretainedValue().player.caption(json: String(cString: json), pts: pts)
+        }
         cb.format = { ctx, w, h, il, ach in
             guard let ctx else { return }
             let e = Unmanaged<Engine>.fromOpaque(ctx).takeUnretainedValue()
@@ -127,6 +143,11 @@ final class Engine {
         tuneLock.lock(); tuneGen += 1; tuneLock.unlock()
     }
 
+    func select(audio index: Int) { cmdLock.lock(); cmdAudio = index; cmdLock.unlock() }
+
+    /// 0 off, 1...4 CC1-CC4, 101...163 DTV service 1-63.
+    func select(captions service: Int) { cmdLock.lock(); cmdCaptions = service; cmdLock.unlock() }
+
     /// Switch the decoded program within the current RF channel.
     func select(program: Int) {
         cmdLock.lock(); cmdProgram = program; cmdLock.unlock()
@@ -154,6 +175,13 @@ final class Engine {
         med.qualityOfService = .userInteractive; med.name = "atsc.media"; med.start()
     }
 
+    private var dumpFile: FileHandle? = {
+        guard let p = ProcessInfo.processInfo.environment["ATSC_DUMP"] else { return nil }
+        FileManager.default.createFile(atPath: p, contents: nil)
+        return FileHandle(forWritingAtPath: p)
+    }()
+    private var dumped = 0
+
     private func dspLoop() {
         let chunk = 1 << 19
         let buf = UnsafeMutablePointer<Int8>.allocate(capacity: chunk)
@@ -162,6 +190,7 @@ final class Engine {
         while true {
             tuneLock.lock(); let gen = tuneGen, hint = tuneHint; tuneLock.unlock()
             if gen != seenGen {
+                if ProcessInfo.processInfo.environment["ATSC_DEBUG"] != nil { FileHandle.standardError.write("DSP reset (retune/gain) gen \(gen)\n".data(using: .utf8)!) }
                 seenGen = gen
                 // skip samples from before the retune (plus 20 ms for the tuner to settle)
                 Thread.sleep(forTimeInterval: 0.02)
@@ -171,6 +200,10 @@ final class Engine {
             var over = false
             let n = ring.read(cursor: &cursor, into: buf, max: chunk, overrun: &over)
             if over { overruns += 1; if let rx { atsc_rx_reset(rx, hint) } }
+            if n > 0, let dump = dumpFile {
+                dump.write(Data(bytes: buf, count: n)); dumped += n
+                if dumped > 120_000_000 { try? dump.close(); dumpFile = nil; FileHandle.standardError.write("dump done\n".data(using: .utf8)!) }
+            }
             if n > 0, let rx { atsc_rx_process(rx, buf, n / 2) }
         }
     }
@@ -190,12 +223,15 @@ final class Engine {
         while true {
             _ = pktSignal.wait(timeout: .now() + .milliseconds(20))
             cmdLock.lock()
-            let reset = cmdReset, prog = cmdProgram
-            cmdReset = false; cmdProgram = nil
+            let reset = cmdReset, prog = cmdProgram, aud = cmdAudio, ccs = cmdCaptions
+            cmdReset = false; cmdProgram = nil; cmdAudio = nil; cmdCaptions = nil
             cmdLock.unlock()
             if let media {
                 if reset { atsc_media_reset(media) }
                 if let prog { atsc_media_select(media, Int32(prog)) }
+                if let aud { atsc_media_select_audio(media, Int32(aud)) }
+                if let ccs { atsc_media_select_captions(media, Int32(ccs)) }
+                publishInfo(media)
             }
             pktLock.lock()
             swap(&local, &pktBuf); swap(&localOK, &pktOK)
@@ -206,6 +242,34 @@ final class Engine {
                 for i in 0..<localOK.count { atsc_media_push(media, b.baseAddress! + 188 * i, Int32(localOK[i])) }
             }
             local.removeAll(keepingCapacity: true); localOK.removeAll(keepingCapacity: true)
+        }
+    }
+
+    private var infoTick = 0
+
+    /// Snapshot the program's audio tracks and caption services (on the media thread).
+    private func publishInfo(_ media: OpaquePointer) {
+        infoTick += 1
+        if infoTick % 10 != 0 { return }
+        var info = ProgramInfo()
+        var t = [atsc_audio_track](repeating: atsc_audio_track(), count: 8)
+        let na = Int(atsc_media_audio_tracks(media, &t, 8))
+        for i in 0..<na {
+            var tr = t[i]
+            let lang = withUnsafeBytes(of: &tr.lang) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+            info.audio.append(AudioTrack(pid: Int(tr.pid), codec: String(cString: atsc_stream_type_name(tr.stream_type)),
+                                         lang: lang, role: Int(tr.role), channels: Int(tr.channels)))
+        }
+        var c = [atsc_caption_service](repeating: atsc_caption_service(), count: 16)
+        let nc = Int(atsc_media_caption_services(media, &c, 16))
+        for i in 0..<nc {
+            var cs = c[i]
+            let lang = withUnsafeBytes(of: &cs.lang) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+            info.captions.append(CaptionService(lang: lang, digital: cs.digital != 0, number: Int(cs.number), easyReader: cs.easy_reader != 0))
+        }
+        if info != lastInfo {
+            lastInfo = info
+            DispatchQueue.main.async { [weak self] in self?.onProgramInfo?(info) }
         }
     }
 

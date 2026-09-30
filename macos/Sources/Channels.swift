@@ -33,8 +33,8 @@ struct VirtualChannel: Codable, Hashable, Identifiable {
     var lna: Int?
     var vga: Int?
     var amp: Bool?
-    /// Set when every receiver setting failed to decode it; hidden until re-enabled, rescanned,
-    /// or a launch-time re-check succeeds. Separate from `hidden`, which is the user's choice.
+    /// Set when every receiver setting failed to decode it: shown as weak, skipped by channel
+    /// up/down, retried when the user picks it. Separate from `hidden` (the user unchecked it).
     var unavailable: Bool?
     var bestSNR: Double?
 
@@ -75,7 +75,8 @@ final class Library {
         prune()
     }
 
-    var visibleChannels: [VirtualChannel] { channels.filter { !$0.hidden && !$0.isUnavailable } }
+    /// Everything the user has not unchecked. Weak channels stay listed (marked) so they can be retried.
+    var visibleChannels: [VirtualChannel] { channels.filter { !$0.hidden } }
     var unavailableRFs: [Int] { Array(Set(channels.filter { $0.isUnavailable && !$0.hidden }.map(\.rf))).sorted() }
 
     /// Every channel on `rf` could not be decoded with any setting.
@@ -122,7 +123,7 @@ final class Library {
     func setHidden(_ id: String, _ hidden: Bool) {
         if let i = channels.firstIndex(where: { $0.id == id }) {
             channels[i].hidden = hidden
-            if !hidden { channels[i].unavailable = nil }     // showing it again means "try it"
+            if !hidden { channels[i].unavailable = nil }     // re-enabling it clears the weak mark
             save()
         }
     }
@@ -171,4 +172,15 @@ final class Library {
         if let d = try? JSONEncoder().encode(guide) { try? d.write(to: Self.folder.appendingPathComponent("guide.json")) }
         dirty = false
     }
+}
+
+/// One caption screen from the decoder (see dsp/atsc_captions.h).
+struct CaptionScreen: Decodable { var regions: [CaptionRegion] }
+
+struct CaptionRegion: Decodable, Hashable {
+    var x: Double
+    var y: Double
+    var anchor: Int
+    var grid: Int?                 // 1 for CEA-608 rows (32 x 15 grid)
+    var lines: [String]
 }

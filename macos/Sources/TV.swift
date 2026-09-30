@@ -16,6 +16,27 @@ final class TV: ObservableObject {
     @Published var volume: Double { didSet { defaults.set(volume, forKey: "volume"); engine.player.volume = Float(volume) } }
     @Published var muted = false { didSet { engine.player.muted = muted } }
 
+    // accessibility: captions and audio tracks
+    @Published var captionsOn: Bool { didSet { defaults.set(captionsOn, forKey: "captionsOn"); applyCaptionChoice() } }
+    @Published var captionLanguage: String { didSet { defaults.set(captionLanguage, forKey: "captionLanguage"); applyCaptionChoice() } }
+    @Published var captionScale: Double { didSet { defaults.set(captionScale, forKey: "captionScale") } }
+    @Published var captionBackground: Double { didSet { defaults.set(captionBackground, forKey: "captionBackground") } }
+    @Published var audioLanguage: String { didSet { defaults.set(audioLanguage, forKey: "audioLanguage") } }
+    @Published var preferDescription: Bool { didSet { defaults.set(preferDescription, forKey: "preferDescription") } }
+    @Published private(set) var audioTracks: [Engine.AudioTrack] = []
+    @Published private(set) var audioIndex = 0
+    @Published private(set) var captionChoices: [CaptionChoice] = []
+    @Published private(set) var captionService = 0          // what is being decoded (0 off)
+    @Published private(set) var captionRegions: [CaptionRegion] = []
+    private var tracksChosenFor: String?
+
+    struct CaptionChoice: Identifiable, Hashable {
+        let service: Int          // 1...4 CC1-CC4, 101... DTV service
+        let lang: String
+        let label: String
+        var id: Int { service }
+    }
+
     // what is on
     @Published private(set) var channels: [VirtualChannel] = []
     @Published private(set) var current: VirtualChannel?
@@ -87,7 +108,15 @@ final class TV: ObservableObject {
     }
 
     private init() {
-        defaults.register(defaults: ["amp": false, "lna": 24, "vga": 20, "autoGain": true, "volume": 0.8])
+        defaults.register(defaults: ["amp": false, "lna": 24, "vga": 20, "autoGain": true, "volume": 0.8,
+                                     "captionsOn": false, "captionLanguage": "eng", "captionScale": 1.0,
+                                     "captionBackground": 0.75, "audioLanguage": "eng", "preferDescription": false])
+        captionsOn = defaults.bool(forKey: "captionsOn")
+        captionLanguage = defaults.string(forKey: "captionLanguage") ?? "eng"
+        captionScale = defaults.double(forKey: "captionScale")
+        captionBackground = defaults.double(forKey: "captionBackground")
+        audioLanguage = defaults.string(forKey: "audioLanguage") ?? "eng"
+        preferDescription = defaults.bool(forKey: "preferDescription")
         ampOn = defaults.bool(forKey: "amp")
         lna = defaults.integer(forKey: "lna")
         vga = defaults.integer(forKey: "vga")
@@ -109,6 +138,8 @@ final class TV: ObservableObject {
         }
         engine.onClock = { [weak self] d in self?.broadcastClock = d }
         engine.player.onAspect = { [weak self] a in self?.aspect = a }
+        engine.player.onCaption = { [weak self] json in self?.showCaptions(json) }
+        engine.onProgramInfo = { [weak self] info in self?.programInfo(info) }
 
         openDevice()
         Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.tick() }
@@ -124,7 +155,6 @@ final class TV: ObservableObject {
             try engine.open(rf: rf, amp: ampOn, lna: lna, vga: vga)
             deviceError = nil
             if firstRun || library.channels.isEmpty { beginSetup() }
-            else if !library.unavailableRFs.isEmpty, !rechecking { recheckUnavailable(then: start) }
             else if let start, !setupVisible { tune(start, showBanner: true) }
         } catch {
             deviceError = error.localizedDescription
@@ -155,6 +185,7 @@ final class TV: ObservableObject {
 
     func tune(_ ch: VirtualChannel, showBanner: Bool = true) {
         guard deviceError == nil else { return }
+        if ch.isUnavailable { flash("\(ch.number) \(ch.name) was too weak last time. Trying again…", seconds: 4) }
         if let cur = current, cur.id != ch.id { previous = cur }
         if engine.currentRF != ch.rf || current == nil {
             engine.tune(rf: ch.rf); lockedAt = nil
@@ -167,15 +198,19 @@ final class TV: ObservableObject {
         current = ch
         hasPicture = false; format = ""; audioLayout = ""
         tunedAt = Date(); lastFrameAt = nil; lastVideoFrames = 0; rsHist = []; weakSignal = false
+        audioTracks = []; audioIndex = 0; captionChoices = []; captionRegions = []; tracksChosenFor = nil
+        applyCaptionChoice()
         if rescue?.rf != ch.rf { rescue = nil; rescueNote = nil }
         defaults.set(ch.id, forKey: "lastChannel")
         if showBanner { showInfo() }
     }
 
+    /// Channel up/down: skips channels marked weak (they can still be chosen directly).
     func step(_ d: Int) {
-        guard !channels.isEmpty else { return }
-        let i = current.flatMap { c in channels.firstIndex { $0.id == c.id } } ?? -d
-        tune(channels[(i + d + channels.count) % channels.count])
+        let list = channels.filter { !$0.isUnavailable || $0.id == current?.id }
+        guard !list.isEmpty else { return }
+        let i = current.flatMap { c in list.firstIndex { $0.id == c.id } } ?? -d
+        tune(list[(i + d + list.count) % list.count])
     }
 
     func recall() { if let p = previous { tune(p) } }
@@ -445,6 +480,122 @@ final class TV: ObservableObject {
         NSWorkspace.shared.open(Self.recordingsFolder)
     }
 
+    // MARK: captions and audio tracks
+
+    static func languageName(_ code: String) -> String {
+        guard !code.isEmpty else { return "Unknown language" }
+        return Locale.current.localizedString(forLanguageCode: code) ?? code.uppercased()
+    }
+
+    static func roleName(_ role: Int) -> String? {
+        switch role {
+        case 1: return "Music and effects"
+        case 2: return "Audio description"
+        case 3: return "Hearing impaired"
+        case 4: return "Dialogue"
+        case 5: return "Commentary"
+        case 6: return "Emergency"
+        default: return nil
+        }
+    }
+
+    func label(for t: Engine.AudioTrack) -> String {
+        var s = Self.languageName(t.lang)
+        if let r = Self.roleName(t.role) { s += " (\(r))" }
+        if t.channels >= 6 { s += " 5.1" }
+        return s
+    }
+
+    private func programInfo(_ info: Engine.ProgramInfo) {
+        audioTracks = info.audio
+        // caption choices: what the broadcaster announces, plus the standard defaults
+        var list: [CaptionChoice] = []
+        for c in info.captions {
+            let svc = c.digital ? 100 + c.number : (c.number == 1 ? 1 : 3)
+            if list.contains(where: { $0.service == svc }) { continue }
+            let name = Self.languageName(c.lang) + (c.easyReader ? " (easy reader)" : "")
+            list.append(CaptionChoice(service: svc, lang: c.lang, label: c.digital ? name : "\(name) (CC\(svc))"))
+        }
+        if !list.contains(where: { $0.service == 101 }) { list.append(CaptionChoice(service: 101, lang: "eng", label: "Service 1 (digital)")) }
+        if !list.contains(where: { $0.service == 1 }) { list.append(CaptionChoice(service: 1, lang: "eng", label: "CC1")) }
+        if !list.contains(where: { $0.service == 3 }) { list.append(CaptionChoice(service: 3, lang: "", label: "CC3")) }
+        captionChoices = list
+        // first time we see this channel's tracks: pick the preferred language / description
+        if let ch = current, tracksChosenFor != ch.id, !info.audio.isEmpty {
+            tracksChosenFor = ch.id
+            let byLang = info.audio.indices.filter { info.audio[$0].lang == audioLanguage }
+            let desc = byLang.first { info.audio[$0].role == 2 }
+            let main = byLang.first { info.audio[$0].role != 2 }
+            let pick = (preferDescription ? desc ?? main : main ?? desc) ?? 0
+            if pick != audioIndex { selectAudio(pick, announce: false) }
+            applyCaptionChoice()
+        }
+    }
+
+    func selectAudio(_ i: Int, announce: Bool = true) {
+        guard audioTracks.indices.contains(i) || audioTracks.isEmpty else { return }
+        audioIndex = i
+        engine.select(audio: i)
+        if announce, audioTracks.indices.contains(i) { flash("Audio: \(label(for: audioTracks[i]))", seconds: 2.5) }
+    }
+
+    func cycleAudio() {
+        guard audioTracks.count > 1 else { flash(audioTracks.isEmpty ? "No audio tracks" : "Only one audio track", seconds: 2); return }
+        let i = (audioIndex + 1) % audioTracks.count
+        audioLanguage = audioTracks[i].lang
+        selectAudio(i)
+    }
+
+    /// The caption service to decode, from the on/off setting and the preferred language.
+    private func preferredCaptionService() -> Int {
+        guard captionsOn else { return 0 }
+        if let c = captionChoices.first(where: { $0.lang == captionLanguage && $0.service > 100 }) { return c.service }
+        if let c = captionChoices.first(where: { $0.lang == captionLanguage }) { return c.service }
+        return captionLanguage == "spa" ? 3 : 101
+    }
+
+    private func applyCaptionChoice() {
+        let svc = preferredCaptionService()
+        if svc != captionService {
+            captionService = svc
+            engine.select(captions: svc)
+            if svc == 0 { captionRegions = [] }
+        }
+    }
+
+    func selectCaptions(_ c: CaptionChoice?) {
+        if let c {
+            captionLanguage = c.lang.isEmpty ? captionLanguage : c.lang
+            captionsOn = true
+            if captionService != c.service { captionService = c.service; engine.select(captions: c.service) }
+            flash("Captions: \(c.label)", seconds: 2.5)
+        } else {
+            captionsOn = false
+            flash("Captions off", seconds: 2)
+        }
+    }
+
+    /// C key: off -> each available service -> off.
+    func cycleCaptions() {
+        let list = captionChoices.isEmpty ? [CaptionChoice(service: 101, lang: "eng", label: "Service 1 (digital)")] : captionChoices
+        if !captionsOn { selectCaptions(list[0]); return }
+        if let i = list.firstIndex(where: { $0.service == captionService }), i + 1 < list.count { selectCaptions(list[i + 1]) }
+        else { selectCaptions(nil) }
+    }
+
+    var captionLabel: String {
+        captionChoices.first { $0.service == captionService }?.label ?? (captionService == 0 ? "Off" : "On")
+    }
+
+    private func showCaptions(_ json: String) {
+        guard captionService != 0, let d = json.data(using: .utf8),
+              let screen = try? JSONDecoder().decode(CaptionScreen.self, from: d) else {
+            if captionService == 0 { captionRegions = [] }
+            return
+        }
+        captionRegions = screen.regions
+    }
+
     // MARK: housekeeping
 
     private func tick() {
@@ -474,17 +625,38 @@ final class TV: ObservableObject {
             if retryTicks % 4 == 0 { openDevice() }
             return
         }
+        if ProcessInfo.processInfo.environment["ATSC_DEBUG"] != nil { debugLog(s, m) }
+        if ProcessInfo.processInfo.environment["ATSC_GAINTEST"] != nil {   // stress test: 2 dB gain jolts
+            gainTestTicks += 1
+            if gainTestTicks % 10 == 0 { vga = vga == 20 ? 22 : 20 }
+        }
         if scanning || rechecking { return }
         superviseReception(s, m)
-        // automatic gain (not while the rescue ladder is setting gains itself)
+        // Automatic gain. Every gain change is a small jolt to the demodulator, so it stays still
+        // while reception is clean and only acts when the level is far off, or data is being lost.
         if autoGain, rescue == nil, s.dbfs > -60 {
-            if s.dbfs > -12 { if vga >= 2 { vga -= 2 } else if lna >= 8 { lna -= 8 } }
-            else if s.dbfs < -24 { if vga <= 60 { vga += 2 } else if lna <= 32 { lna += 8 } }
+            let clean = hasPicture && lossRate < 0.01
+            let high = clean ? -8.0 : -12.0, low = clean ? -32.0 : -24.0
+            if s.dbfs > high { if vga >= 2 { vga -= 2 } else if lna >= 8 { lna -= 8 } }
+            else if s.dbfs < low { if vga <= 60 { vga += 2 } else if lna <= 32 { lna += 8 } }
         }
         if ampOn && s.dbfs > -6 {
             ampOn = false
             flash("Signal very strong: RF amplifier switched off")
         }
+    }
+
+    private var dbgPrev: (Date, UInt64, UInt64)?
+    private var gainTestTicks = 0
+    private func debugLog(_ s: atsc_stats, _ m: atsc_media_status) {
+        let now = Date()
+        var vfps = 0.0, afps = 0.0
+        if let p = dbgPrev { let dt = now.timeIntervalSince(p.0); vfps = Double(m.video_frames &- p.1) / dt; afps = Double(m.audio_frames &- p.2) / dt }
+        dbgPrev = (now, m.video_frames, m.audio_frames)
+        FileHandle.standardError.write(String(format: "t=%.1f fields=%llu clock=%+.2fppm pilot=%.0fdB ", now.timeIntervalSince(tunedAt), s.fields, s.clock_ppm, s.pilot_snr_db).data(using: .utf8)!)
+        FileHandle.standardError.write(String(format: "state=%d snr=%.1f dbfs=%.1f lna=%d vga=%d amp=%d loss=%.1f%% video=%.1ffps audio=%.1ffr/s overruns=%d rescue=%@ dropped=%llu\n",
+            s.state.rawValue, s.snr_db, s.dbfs, lna, vga, ampOn ? 1 : 0, lossRate * 100, vfps, afps, engine.overruns,
+            rescueNote ?? "-", m.dropped_packets).data(using: .utf8)!)
     }
 
     /// Is the current channel failing because of the signal (as opposed to, say, a codec)?
@@ -495,12 +667,18 @@ final class TV: ObservableObject {
     /// Starts and steps the rescue ladder for the current channel when reception fails.
     private func superviseReception(_ s: atsc_stats, _ m: atsc_media_status) {
         guard let ch = current, !setupVisible else { return }
+        if ch.isUnavailable, hasPicture, lossRate < 0.05 {       // a weak channel that works now
+            library.restore(rf: ch.rf)
+            channels = library.visibleChannels
+            current = channels.first { $0.id == ch.id } ?? ch
+        }
         if var r = rescue {
             if r.settling { return }
             r.bestSNR = max(r.bestSNR, s.state == ATSC_LOCKED ? s.snr_db : 0)
             if hasPicture && lossRate < 0.05 {
                 // this setting works: keep it for the RF channel
                 library.setGains(rf: r.rf, lna: lna, vga: vga, amp: ampOn)
+                library.restore(rf: r.rf)
                 channels = library.visibleChannels
                 flash("Reception recovered (\(Rescue.ladder[r.step].note.lowercased()))")
                 rescue = nil; rescueNote = nil
@@ -557,49 +735,12 @@ final class TV: ObservableObject {
         channels = library.visibleChannels
         let why = bestSNR > 0 ? String(format: "best signal quality %.1f dB, about 15 dB is needed", bestSNR)
                               : "no usable signal"
-        flash("\(ch.number) \(ch.name) is too weak to receive right now (\(why)). It is hidden until it improves, "
-              + "you rescan, or you turn it back on in Settings > Channels.", seconds: 9)
+        flash("\(ch.number) \(ch.name) is too weak to receive right now (\(why)). It stays in the list marked weak; "
+              + "choose it again to retry. Channel up/down will skip it.", seconds: 9)
         if let back = previous.flatMap({ p in channels.first { $0.id == p.id } }) ?? channels.first {
             current = nil; tune(back)
         } else {
             current = nil
-        }
-    }
-
-    /// At launch: quietly try channels that were marked unavailable; restore those that decode now.
-    private func recheckUnavailable(then start: VirtualChannel?) {
-        let rfs = library.unavailableRFs
-        rechecking = true
-        flash("Checking \(rfs.count == 1 ? "a weak channel" : "\(rfs.count) weak channels") again…", seconds: 20)
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self else { return }
-            var restored: [Int] = []
-            for rf in rfs {
-                for (i, useAmp) in [false, true].enumerated() {
-                    let r = self.scanOne(rf: rf, lockWait: 3, tableWait: 4, target: i == 0 ? -16 : -12, allowAmp: useAmp)
-                    if !r.list.isEmpty && (r.list.first?.signalDB ?? 0) >= 15.5 {
-                        DispatchQueue.main.sync {
-                            self.library.restore(rf: rf)
-                            if let c = r.list.first { self.library.setGains(rf: rf, lna: c.lna ?? 24, vga: c.vga ?? 20, amp: c.amp ?? false) }
-                        }
-                        restored.append(rf)
-                        break
-                    }
-                }
-            }
-            DispatchQueue.main.async {
-                self.rechecking = false
-                self.engine.device?.setAmp(self.ampOn)
-                self.channels = self.library.visibleChannels
-                self.status = nil
-                if !restored.isEmpty {
-                    let n = self.library.channels.filter { restored.contains($0.rf) }.count
-                    self.flash("Reception improved: \(n) channel\(n == 1 ? "" : "s") restored", seconds: 5)
-                }
-                if let start = start.flatMap({ s in self.channels.first { $0.id == s.id } }) ?? self.channels.first {
-                    self.current = nil; self.tune(start)
-                }
-            }
         }
     }
 

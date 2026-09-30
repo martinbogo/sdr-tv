@@ -16,12 +16,13 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$OBJ"
 # C signal processing and media (portable across Apple Silicon: target the M1 baseline)
 clang -c -O3 -mcpu=apple-m1 -ffast-math -mmacosx-version-min=14.0 -o "$OBJ/atsc_rx.o" ../dsp/atsc_rx.c
 clang -c -O2 -mcpu=apple-m1 -mmacosx-version-min=14.0 -I"$FF/include" -o "$OBJ/atsc_media.o" ../dsp/atsc_media.c
+clang -c -O2 -mcpu=apple-m1 -mmacosx-version-min=14.0 -o "$OBJ/atsc_captions.o" ../dsp/atsc_captions.c
 
 swiftc -O -swift-version 5 -parse-as-library \
     -target arm64-apple-macos14.0 \
     -import-objc-header Sources/Bridging.h -I "$BREW/include" \
     Sources/*.swift \
-    "$OBJ/atsc_rx.o" "$OBJ/atsc_media.o" \
+    "$OBJ/atsc_rx.o" "$OBJ/atsc_media.o" "$OBJ/atsc_captions.o" \
     "$FF/lib/libavfilter.a" "$FF/lib/libswscale.a" "$FF/lib/libswresample.a" "$FF/lib/libavcodec.a" "$FF/lib/libavutil.a" \
     "$BREW/lib/libhackrf.a" "$BREW/lib/libusb-1.0.a" \
     -framework Accelerate -framework AVFoundation -framework CoreMedia -framework CoreVideo \

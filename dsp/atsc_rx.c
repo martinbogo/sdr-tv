@@ -1,7 +1,7 @@
 // Streaming ATSC 1.0 (8VSB) receiver. See atsc_rx.h and prototype/*.py.
 #include "atsc_rx.h"
 #include <stdio.h>
-int atsc_debug = 0; double atsc_tsign = 1, atsc_tgain = 0.3, atsc_fgain = 0.02, atsc_pkp = 0.005, atsc_pki = 5e-8;
+int atsc_debug = 0; double atsc_tsign = 1, atsc_tgain = 0.2, atsc_fgain = 0.01, atsc_pkp = 0.005, atsc_pki = 5e-8;
 
 #include <Accelerate/Accelerate.h>
 #include <dispatch/dispatch.h>
@@ -104,6 +104,9 @@ struct atsc_rx {
     double pil_r, pil_i;                      // lowpassed pilot phasor
     int pil_cnt; double pil_acc_r, pil_acc_i;
     double pil_err_acc; long pil_err_n;
+    int timing_lost, segs_since_field;
+    uint64_t resyncs;
+    uint64_t dfe_resets;
 
     // matched filter (overlap-save)
     vDSP_DFT_Setup dft_f, dft_i;
@@ -429,6 +432,7 @@ static void frontend_reset(atsc_rx *rx, double pilot_hint_hz) {
     rx->seg_win = 0; memset(rx->seg_acc, 0, sizeof rx->seg_acc);
     rx->pn_avg = 0; rx->pn_n = 0;
     rx->seg_next = 0;
+    rx->timing_lost = 0; rx->segs_since_field = 0;
 }
 
 void atsc_rx_get_stats(atsc_rx *rx, atsc_stats *o) {
@@ -701,6 +705,9 @@ static int seg_frontend(atsc_rx *rx, int64_t s0) {
         // unambiguous timing error detector within +-4 half-symbols. Positive phase = grid late.
         double phi = atan2(rx->seg_acc[2].i, rx->seg_acc[2].r);
         double err = atsc_tsign * phi / (M_PI / 4);       // half-symbols
+        // one disturbed measurement (a gain step, an impulse) must not throw the loop: the clock
+        // moves only ~0.1 half-symbols per update, so cap each correction
+        if (err > 1) err = 1; else if (err < -1) err = -1;
         if (atsc_debug) {
             fprintf(stderr, "timing err %+.3f pilot phase rms %.1f deg\n", err,
                     sqrt(rx->pil_err_acc / fmax(rx->pil_err_n, 1)) * 180 / M_PI);
@@ -708,6 +715,11 @@ static int seg_frontend(atsc_rx *rx, int64_t s0) {
         }
         rx->tau -= atsc_tgain * err * rx->step;               // phase correction
         rx->step *= 1 - atsc_fgain * err / (24.0 * HSEG);     // frequency correction
+        // A real clock is within a few ppm. If the loop has run away (e.g. after a front-end
+        // transient disturbed the phase it measures), reacquire from scratch: ~0.1 s.
+        double nominal = rx->fs / (2 * RS_SYM);
+        double ppm = (rx->step / nominal - 1) * 1e6;
+        if (fabs(ppm) > 20) rx->timing_lost = 1;
         rx->seg_win = 0; memset(rx->seg_acc, 0, sizeof rx->seg_acc);
     }
 
@@ -719,6 +731,12 @@ static int seg_frontend(atsc_rx *rx, int64_t s0) {
     if (!is_field) { rx->pn_avg = rx->pn_n ? 0.98 * rx->pn_avg + 0.02 * pm : pm; rx->pn_n++; }
 
     if (rx->state == ATSC_ACQ_SEGMENT && rx->pn_n > 64) rx->state = ATSC_ACQ_FIELD;
+    // Loss of sync: a gap in the sample stream (e.g. the tuner pausing USB while its gain changes)
+    // shifts the whole symbol grid. If no field sync is actually seen for three fields, start over.
+    if (is_field) rx->segs_since_field = 0;
+    else if (++rx->segs_since_field > 3 * FIELD_SEGS + 8 && rx->state >= ATSC_ACQ_FIELD) {
+        rx->timing_lost = 1; rx->resyncs++;
+    }
     return is_field;
 }
 
@@ -752,6 +770,10 @@ static void seg_dfe(atsc_rx *rx, const seg_desc *d) {
         rx->train_err = 0; rx->train_n = 0;
         for (int n = 0; n < SEG; n++) dfe_symbol(rx, s0 + 2 * n, n < TRAIN_LEN, n < TRAIN_LEN ? t[n] : 0);
         if (rx->train_n) rx->snr_db = 10 * log10(21.0 / fmax(rx->train_err / rx->train_n, 1e-9));
+        // A decision-feedback equalizer that has been knocked off (a gain step, an impulse) can
+        // lock onto wrong decisions and never recover. If it measures badly on the known training
+        // sequence, solve it again from scratch on this field's training data.
+        if (rx->snr_db < 12) { dfe_init_ls(rx, s0); rx->dfe_resets++; }
         rx->seg_in_field = 1;
         return;
     }
@@ -768,6 +790,7 @@ static void seg_dfe(atsc_rx *rx, const seg_desc *d) {
 
 static void *thread2(void *arg) {
     atsc_rx *rx = arg;
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);   // keep it on performance cores
     while (1) {
         dispatch_semaphore_wait(rx->q1_items, DISPATCH_TIME_FOREVER);
         if (atomic_load(&rx->quit)) break;
@@ -785,6 +808,7 @@ static void *thread2(void *arg) {
 
 static void *thread3(void *arg) {
     atsc_rx *rx = arg;
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     while (1) {
         dispatch_semaphore_wait(rx->q2_items, DISPATCH_TIME_FOREVER);
         if (atomic_load(&rx->quit)) break;
@@ -806,7 +830,9 @@ static void *thread3(void *arg) {
 
 static void push_u(atsc_rx *rx, cf v) {
     double p = v.r * v.r + v.i * v.i;
-    rx->u_pow = rx->u_count < 1000 ? (rx->u_pow * rx->u_count + p) / (rx->u_count + 1) : 0.99999 * rx->u_pow + 0.00001 * p;
+    // level normalisation: ~0.25 ms time constant, fast enough to absorb a tuner gain step before
+    // the equalizer's decisions go wrong, slow enough to be steady on 8VSB's constant power
+    rx->u_pow = rx->u_count < 1000 ? (rx->u_pow * rx->u_count + p) / (rx->u_count + 1) : 0.9998 * rx->u_pow + 0.0002 * p;
     float g = (float)(1.0 / sqrt(fmax(rx->u_pow, 1e-12)));
     v.r *= g; v.i *= g;
     rx->u[rx->u_count & (rx->u_cap - 1)] = v;
@@ -942,6 +968,11 @@ static void acquire_pilot(atsc_rx *rx) {
 
 void atsc_rx_process(atsc_rx *rx, const int8_t *iq, size_t n) {
     if (atomic_exchange(&rx->reset_req, 0)) frontend_reset(rx, rx->reset_hint);
+    if (rx->timing_lost) {
+        // keep the known pilot frequency as the hint so reacquisition is quick
+        double hint = rx->state >= ATSC_ACQ_SEGMENT ? -rx->nco_f * rx->fs / (2 * M_PI) : rx->pilot_hint;
+        frontend_reset(rx, hint);
+    }
     // input level
     double pw = 0;
     for (size_t k = 0; k < 2 * n; k++) pw += (double)iq[k] * iq[k];

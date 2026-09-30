@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <math.h>
+#include <string.h>
 extern int atsc_debug; extern double atsc_tsign, atsc_tgain, atsc_fgain, atsc_pkp, atsc_pki;
 
 static FILE *out;
@@ -25,6 +27,24 @@ int main(int argc, char **argv) {
     struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
     double next_report = 0.25;
     while ((n = fread(buf, 2, chunk, f)) > 0) {
+        // optional simulated tuner gain step: every STEP_EVERY s, toggle x1.26 amplitude and STEP_PHASE degrees
+        if (getenv("STEP_EVERY")) {
+            double every = atof(getenv("STEP_EVERY")), phdeg = getenv("STEP_PHASE") ? atof(getenv("STEP_PHASE")) : 0;
+            int on = ((int)((total / 20e6) / every)) % 2;
+            if (on) {
+                double g = 1.26, c = g * cos(phdeg * M_PI / 180), sn = g * sin(phdeg * M_PI / 180);
+                for (size_t k = 0; k < n; k++) {
+                    double i = buf[2 * k], q = buf[2 * k + 1];
+                    double ni = i * c - q * sn, nq = i * sn + q * c;
+                    buf[2 * k] = (int8_t)fmax(-128, fmin(127, lround(ni))); buf[2 * k + 1] = (int8_t)fmax(-128, fmin(127, lround(nq)));
+                }
+            }
+        }
+        // optional simulated sample gap: every GAP_EVERY s drop GAP samples
+        if (getenv("GAP_EVERY")) {
+            static double next_gap = 0; if (next_gap == 0) next_gap = atof(getenv("GAP_EVERY"));
+            if (total / 20e6 >= next_gap) { size_t g = (size_t)atol(getenv("GAP")); if (g < n) { memmove(buf, buf + 2 * g, 2 * (n - g)); n -= g; } next_gap += atof(getenv("GAP_EVERY")); }
+        }
         atsc_rx_process(rx, buf, n);
         total += n;
         double sig_t = total / 20e6;
