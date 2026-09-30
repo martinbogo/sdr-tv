@@ -93,7 +93,7 @@ struct atsc_rx {
     double pilot_hint;
 
     // stats
-    double dbfs, snr_db;
+    double dbfs, snr_db, pilot_snr;
     uint64_t fields, rs_good, rs_corr, rs_bad, packets;
 
     // pilot acquisition buffer
@@ -415,6 +415,7 @@ static void frontend_reset(atsc_rx *rx, double pilot_hint_hz) {
     atomic_fetch_add(&rx->gen, 1);
     rx->state = ATSC_ACQ_PILOT;
     rx->pilot_hint = pilot_hint_hz;
+    rx->pilot_snr = 0;
     rx->acq_n = 0;
     rx->nco_ph = 0; rx->nco_f = 0;
     rx->pil_r = 0; rx->pil_i = 0; rx->pil_cnt = 0; rx->pil_acc_r = rx->pil_acc_i = 0;
@@ -436,6 +437,7 @@ void atsc_rx_get_stats(atsc_rx *rx, atsc_stats *o) {
     o->clock_ppm = (rx->step / (rx->fs / (2 * RS_SYM)) - 1) * 1e6;
     o->snr_db = rx->snr_db;
     o->dbfs = rx->dbfs;
+    o->pilot_snr_db = rx->pilot_snr;
     o->fields = rx->fields;
     o->rs_good = rx->rs_good; o->rs_corrected = rx->rs_corr; o->rs_bad = rx->rs_bad;
     o->packets = rx->packets;
@@ -917,6 +919,18 @@ static void acquire_pilot(atsc_rx *rx) {
         mag[d + 1] = log(re[idx] * re[idx] + im[idx] * im[idx] + 1e-20);
     }
     double off = 0.5 * (mag[0] - mag[2]) / (mag[0] - 2 * mag[1] + mag[2]);
+    // how far the pilot stands out: peak over the median bin in the search window
+    {
+        int nb = hi - lo + 1;
+        float *tmp = malloc(sizeof(float) * nb);
+        for (int b = lo; b <= hi; b++) {
+            size_t idx = (size_t)((b % (int)n + (int)n) % (int)n);
+            tmp[b - lo] = re[idx] * re[idx] + im[idx] * im[idx];
+        }
+        vDSP_vsort(tmp, nb, 1);
+        rx->pilot_snr = 10 * log10(bm / fmax(tmp[nb / 2], 1e-20));
+        free(tmp);
+    }
     double f = (best + off) * binhz;
     rx->nco_f = -2 * M_PI * f / rx->fs;       // NCO rotates by -f
     rx->nco_ph = 0;

@@ -20,6 +20,7 @@ final class TV: ObservableObject {
     @Published private(set) var channels: [VirtualChannel] = []
     @Published private(set) var current: VirtualChannel?
     private var previous: VirtualChannel?
+    @Published private(set) var aspect: CGFloat = 16.0 / 9.0   // picture display aspect
     @Published private(set) var format = ""          // "1080i", "720p", "480i"
     @Published private(set) var audioLayout = ""     // "5.1", "Stereo"
     @Published private(set) var stats = atsc_stats()
@@ -38,6 +39,7 @@ final class TV: ObservableObject {
     @Published private(set) var scanning = false
     @Published private(set) var scanProgress = 0.0
     @Published private(set) var scanRF = 0
+    @Published private(set) var scanPhase = ""
     @Published private(set) var scanResults: [VirtualChannel] = []
     @Published private(set) var scanFinished = false
     @Published var setupVisible = false             // modal scan window (first run, or a rescan)
@@ -75,6 +77,7 @@ final class TV: ObservableObject {
             audioLayout = ach >= 6 ? "5.1" : ach == 1 ? "Mono" : ach > 0 ? "Stereo" : ""
         }
         engine.onClock = { [weak self] d in self?.broadcastClock = d }
+        engine.player.onAspect = { [weak self] a in self?.aspect = a }
 
         openDevice()
         Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.tick() }
@@ -121,7 +124,13 @@ final class TV: ObservableObject {
     func tune(_ ch: VirtualChannel, showBanner: Bool = true) {
         guard deviceError == nil else { return }
         if let cur = current, cur.id != ch.id { previous = cur }
-        if engine.currentRF != ch.rf || current == nil { engine.tune(rf: ch.rf); lockedAt = nil }
+        if engine.currentRF != ch.rf || current == nil {
+            engine.tune(rf: ch.rf); lockedAt = nil
+            // per-channel gain from the scan (automatic gain, if on, refines it from here)
+            if let l = ch.lna { lna = l }
+            if let v = ch.vga { vga = v }
+            if let a = ch.amp, a != ampOn { ampOn = a }
+        }
         engine.select(program: ch.program)
         current = ch
         hasPicture = false; format = ""; audioLayout = ""
@@ -186,54 +195,111 @@ final class TV: ObservableObject {
     private var scanFound: [VirtualChannel] = []
     private var scanCancel = false
 
+    /// Set LNA/VGA (and optionally the RF amp) on the device to bring the ADC level near `target`
+    /// dBFS for the RF channel just tuned. Runs on the scan thread. Returns the settings used.
+    private func settleGain(target: Double, allowAmp: Bool) -> (lna: Int, vga: Int, amp: Bool, dbfs: Double) {
+        var l = 24, v = 20, amp = false
+        let dev = engine.device
+        dev?.setAmp(false); dev?.setLNA(l); dev?.setVGA(v)
+        var level = -100.0
+        for _ in 0..<6 {
+            Thread.sleep(forTimeInterval: 0.12)
+            level = engine.stats().dbfs
+            let err = target - level
+            if abs(err) < 3 { break }
+            var nv = v + Int((err / 2).rounded()) * 2
+            var rest = 0
+            if nv > 62 { rest = nv - 62; nv = 62 } else if nv < 0 { rest = nv; nv = 0 }
+            if rest > 4, l <= 32 { l += 8; nv = max(0, nv - 8) }
+            else if rest < -4, l >= 8 { l -= 8; nv = min(62, nv + 8) }
+            else if rest > 6, l == 40, v == 62, allowAmp, !amp { amp = true; dev?.setAmp(true) }
+            if nv == v && rest == 0 { break }
+            v = nv
+            dev?.setLNA(l); dev?.setVGA(v)
+        }
+        // front-end protection, as in normal viewing
+        if amp && level > -6 { amp = false; dev?.setAmp(false) }
+        return (l, v, amp, level)
+    }
+
+    /// One RF channel: gain, lock, then the virtual channel table (and a little guide data).
+    private func scanOne(rf: Int, lockWait: Double, tableWait: Double, target: Double, allowAmp: Bool)
+        -> (list: [VirtualChannel], pilotSNR: Double) {
+        DispatchQueue.main.sync {
+            scanRF = rf
+            scanFound = []
+            engine.tune(rf: rf)
+            engine.select(program: -1)                 // demodulate and read tables, decode nothing
+        }
+        let g = settleGain(target: target, allowAmp: allowAmp)
+        engine.retune()                                // reacquire at the new gain
+        var locked = false
+        let lockDeadline = Date().addingTimeInterval(lockWait)
+        while Date() < lockDeadline {
+            Thread.sleep(forTimeInterval: 0.1)
+            if engine.stats().state == ATSC_LOCKED { locked = true; break }
+        }
+        let pilot = engine.stats().pilot_snr_db
+        guard locked else { return ([], pilot) }
+        let snr = engine.stats().snr_db
+        let tableDeadline = Date().addingTimeInterval(tableWait)
+        var got: [VirtualChannel] = []
+        while Date() < tableDeadline {
+            Thread.sleep(forTimeInterval: 0.1)
+            got = DispatchQueue.main.sync { self.scanFound }
+            if !got.isEmpty { break }
+        }
+        if !got.isEmpty { Thread.sleep(forTimeInterval: 1.5) }    // collect some guide data
+        let list = got.filter { $0.rf == rf }.map { c -> VirtualChannel in
+            var c = c; c.signalDB = snr; c.lna = g.lna; c.vga = g.vga; c.amp = g.amp; return c
+        }
+        return (list, pilot)
+    }
+
     func scan() {
         guard !scanning, deviceError == nil else { return }
         scanning = true; scanProgress = 0; scanCancel = false; scanFinished = false; scanResults = []
         guideVisible = false; bannerVisible = false
         hasPicture = false
         let rfs = RFBand.channels
-        let engine = self.engine
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             var found: [VirtualChannel] = []
+            var weak: [Int] = []
+            func publish() {
+                DispatchQueue.main.sync {
+                    self?.scanResults = found.filter { !$0.hidden }.sorted { ($0.major, $0.minor) < ($1.major, $1.minor) }
+                }
+            }
+            // pass 1: every RF channel, gain set for that channel
             for (i, rf) in rfs.enumerated() {
                 guard let self, !self.scanCancel else { break }
+                DispatchQueue.main.sync { self.scanProgress = 0.8 * Double(i) / Double(rfs.count); self.scanPhase = "" }
+                let r = self.scanOne(rf: rf, lockWait: 1.6, tableWait: 3.5, target: -18, allowAmp: false)
+                if r.list.isEmpty {
+                    if r.pilotSNR > 20 { weak.append(rf) }         // an 8VSB pilot is there but no lock
+                } else { found.append(contentsOf: r.list); publish() }
+            }
+            // pass 2: weak candidates get more gain, the RF amp if still low, and longer to lock
+            for (i, rf) in weak.enumerated() {
+                guard let self, !self.scanCancel else { break }
                 DispatchQueue.main.sync {
-                    self.scanProgress = Double(i) / Double(rfs.count)
-                    self.scanRF = rf
-                    self.scanFound = []
-                    engine.tune(rf: rf)
-                    engine.select(program: -1)             // demodulate and read tables, decode nothing
+                    self.scanProgress = 0.8 + 0.2 * Double(i) / Double(max(weak.count, 1))
+                    self.scanPhase = "Retrying weak signals"
                 }
-                // wait for 8VSB lock, then for the virtual channel table
-                var locked = false
-                let lockDeadline = Date().addingTimeInterval(1.6)
-                while Date() < lockDeadline {
-                    Thread.sleep(forTimeInterval: 0.1)
-                    if engine.stats().state == ATSC_LOCKED { locked = true; break }
+                var r = self.scanOne(rf: rf, lockWait: 4, tableWait: 6, target: -12, allowAmp: false)
+                if r.list.isEmpty, !self.scanCancel {
+                    r = self.scanOne(rf: rf, lockWait: 5, tableWait: 6, target: -12, allowAmp: true)
                 }
-                guard locked else { continue }
-                let snr = engine.stats().snr_db
-                let tableDeadline = Date().addingTimeInterval(3.5)
-                var got: [VirtualChannel] = []
-                while Date() < tableDeadline {
-                    Thread.sleep(forTimeInterval: 0.1)
-                    got = DispatchQueue.main.sync { self.scanFound }
-                    if !got.isEmpty { break }
-                }
-                // linger briefly to collect guide data for this station
-                if !got.isEmpty { Thread.sleep(forTimeInterval: 1.5) }
-                let list = got.filter { $0.rf == rf }.map { c -> VirtualChannel in var c = c; c.signalDB = snr; return c }
-                found.append(contentsOf: list)
-                DispatchQueue.main.sync {
-                    self.scanResults = found.filter { !$0.hidden }.sorted { ($0.major, $0.minor) < ($1.major, $1.minor) }
-                }
+                if !r.list.isEmpty { found.append(contentsOf: r.list); publish() }
             }
             DispatchQueue.main.async {
                 guard let self else { return }
                 let completed = !self.scanCancel
+                self.engine.device?.setAmp(self.ampOn); self.engine.device?.setLNA(self.lna); self.engine.device?.setVGA(self.vga)
                 self.scanning = false
                 self.scanProgress = 1
                 self.scanFinished = true
+                self.scanPhase = ""
                 if completed || !found.isEmpty {
                     // a finished scan replaces the list; keep the user's hidden choices
                     self.library.replaceAll(found, keepingHiddenFrom: self.library.channels)

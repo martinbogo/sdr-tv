@@ -122,6 +122,11 @@ final class Engine {
         player.flush()
     }
 
+    /// Reacquire on the current RF channel (after a gain change), dropping older samples.
+    func retune() {
+        tuneLock.lock(); tuneGen += 1; tuneLock.unlock()
+    }
+
     /// Switch the decoded program within the current RF channel.
     func select(program: Int) {
         cmdLock.lock(); cmdProgram = program; cmdLock.unlock()

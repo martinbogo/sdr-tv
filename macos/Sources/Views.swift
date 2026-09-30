@@ -5,19 +5,41 @@ import SwiftUI
 
 struct VideoSurface: NSViewRepresentable {
     let layer: AVSampleBufferDisplayLayer
+    let aspect: CGFloat
 
-    func makeNSView(context: Context) -> NSView {
-        let v = NSView()
-        v.wantsLayer = true
-        v.layer = CALayer()
-        v.layer?.backgroundColor = CGColor.black
-        layer.frame = v.bounds
-        layer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
-        v.layer?.addSublayer(layer)
+    func makeNSView(context: Context) -> VideoHostView {
+        let v = VideoHostView()
+        v.videoLayer = layer
+        v.aspect = aspect
         return v
     }
 
-    func updateNSView(_ nsView: NSView, context: Context) {}
+    func updateNSView(_ v: VideoHostView, context: Context) {
+        if v.aspect != aspect { v.aspect = aspect; v.needsLayout = true }
+    }
+}
+
+/// Black view that keeps the video layer centred at the picture's display aspect ratio.
+final class VideoHostView: NSView {
+    var videoLayer: AVSampleBufferDisplayLayer? {
+        didSet {
+            wantsLayer = true
+            layer = CALayer()
+            layer?.backgroundColor = CGColor.black
+            if let v = videoLayer { layer?.addSublayer(v) }
+        }
+    }
+    var aspect: CGFloat = 16.0 / 9.0
+
+    override func layout() {
+        super.layout()
+        guard let v = videoLayer, bounds.width > 0, bounds.height > 0 else { return }
+        var w = bounds.width, h = w / aspect
+        if h > bounds.height { h = bounds.height; w = h * aspect }
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        v.frame = CGRect(x: (bounds.width - w) / 2, y: (bounds.height - h) / 2, width: w, height: h)
+        CATransaction.commit()
+    }
 }
 
 // MARK: - main screen
@@ -29,7 +51,7 @@ struct TVScreen: View {
     var body: some View {
         ZStack {
             Color.black
-            VideoSurface(layer: tv.engine.player.layer)
+            VideoSurface(layer: tv.engine.player.layer, aspect: tv.aspect)
                 .opacity(tv.hasPicture && !tv.scanning && !tv.setupVisible ? 1 : 0)
             idleMessage
             VStack(spacing: 0) {
@@ -600,7 +622,8 @@ struct SetupSheet: View {
     private var progressText: String {
         if tv.scanFinished { return "Scan complete" }
         if tv.scanRF == 0 { return "Starting…" }
-        return "RF channel \(tv.scanRF) (\(Int(RFBand.centerMHz(tv.scanRF))) MHz) · \(tv.scanResults.count) found"
+        let phase = tv.scanPhase.isEmpty ? "" : "\(tv.scanPhase) · "
+        return "\(phase)RF channel \(tv.scanRF) (\(Int(RFBand.centerMHz(tv.scanRF))) MHz) · \(tv.scanResults.count) found"
     }
 
     private func bars(_ snr: Double) -> Int { snr < 15 ? 1 : snr < 18 ? 2 : snr < 21 ? 3 : 4 }

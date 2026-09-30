@@ -29,6 +29,10 @@ struct VirtualChannel: Codable, Hashable, Identifiable {
     var sourceID: Int
     var hidden = false
     var signalDB: Double = 0
+    // receiver settings the scan found best for this RF channel (optional: older lists lack them)
+    var lna: Int?
+    var vga: Int?
+    var amp: Bool?
 
     var id: String { "\(major).\(minor)" }
     var number: String { "\(major).\(minor)" }

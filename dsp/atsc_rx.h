@@ -29,6 +29,7 @@ typedef struct {
     double clock_ppm;           // symbol clock vs nominal
     double snr_db;              // equalizer SNR on the last field sync (training)
     double dbfs;                // input level
+    double pilot_snr_db;        // pilot peak over the local spectrum median at acquisition (8VSB present if > ~15)
     uint64_t fields;            // field syncs seen since lock
     uint64_t rs_good, rs_corrected, rs_bad;   // Reed-Solomon codewords since reset
     uint64_t packets;

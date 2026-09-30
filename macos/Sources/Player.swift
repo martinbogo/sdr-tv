@@ -21,11 +21,18 @@ final class Player {
     private var audioFormat: CMAudioFormatDescription?
     private var pendingSince: Date?
 
+    /// Display aspect ratio (width / height) of the picture, reported once it has been stable
+    /// for ~15 frames so a stray frame cannot make the picture jump. Called on the main thread.
+    var onAspect: ((CGFloat) -> Void)?
+    private var shownAspect: CGFloat = 16.0 / 9.0
+    private var candidateAspect: CGFloat = 0
+    private var candidateCount = 0
+    private var fmtDesc: CMVideoFormatDescription?
     /// How far behind the live broadcast playback runs, to absorb decode and delivery jitter.
     let latency: Int64 = 45_000                 // 0.5 s in 90 kHz ticks
 
     init() {
-        layer.videoGravity = .resizeAspect
+        layer.videoGravity = .resize             // the view sizes the layer to the right shape
         layer.backgroundColor = CGColor.black
         sync.addRenderer(layer.sampleBufferRenderer)
         sync.addRenderer(audio)
@@ -50,6 +57,8 @@ final class Player {
         started = false
         lastRaw = [nil, nil]
         wrapBase = [0, 0]
+        candidateCount = 0
+        fmtDesc = nil
         pendingSince = nil
     }
 
@@ -111,7 +120,7 @@ final class Player {
             ]
             var p: CVPixelBufferPool?
             CVPixelBufferPoolCreate(nil, nil, attrs as CFDictionary, &p)
-            pool = p; poolW = width; poolH = height
+            pool = p; poolW = width; poolH = height; fmtDesc = nil
         }
         guard let pool else { return }
         var pbOut: CVPixelBuffer?
@@ -137,14 +146,19 @@ final class Player {
         CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey,
                               hd ? kCVImageBufferColorPrimaries_ITU_R_709_2 : kCVImageBufferColorPrimaries_SMPTE_C, .shouldPropagate)
         CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, .shouldPropagate)
-        if sarNum > 0, sarDen > 0, sarNum != sarDen {
-            let par: [String: Any] = [kCVImageBufferPixelAspectRatioHorizontalSpacingKey as String: sarNum,
-                                      kCVImageBufferPixelAspectRatioVerticalSpacingKey as String: sarDen]
-            CVBufferSetAttachment(pb, kCVImageBufferPixelAspectRatioKey, par as CFDictionary, .shouldPropagate)
+        // display shape = frame size x pixel aspect; applied by sizing the layer, not by buffer tags
+        let par = sarNum > 0 && sarDen > 0 ? CGFloat(sarNum) / CGFloat(sarDen) : 1
+        let aspect = (CGFloat(width) * par / CGFloat(height) * 1000).rounded() / 1000
+        if aspect == candidateAspect { candidateCount += 1 } else { candidateAspect = aspect; candidateCount = 1 }
+        if candidateCount == 15, aspect != shownAspect {
+            shownAspect = aspect
+            DispatchQueue.main.async { [weak self] in self?.onAspect?(aspect) }
         }
-        var fmt: CMVideoFormatDescription?
-        CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: pb, formatDescriptionOut: &fmt)
-        guard let fmt else { return }
+        if fmtDesc == nil || !CMVideoFormatDescriptionMatchesImageBuffer(fmtDesc!, imageBuffer: pb) {
+            fmtDesc = nil
+            CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: pb, formatDescriptionOut: &fmtDesc)
+        }
+        guard let fmt = fmtDesc else { return }
         var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: CMTime(value: pts, timescale: 90_000),
                                         decodeTimeStamp: .invalid)
         var sb: CMSampleBuffer?
