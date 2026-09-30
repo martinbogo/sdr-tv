@@ -1,0 +1,462 @@
+// ATSC transport stream demultiplexer, PSIP parser (A/65) and decoder (FFmpeg: MPEG-2, AC-3).
+#include "atsc_media.h"
+
+#include <libavcodec/avcodec.h>
+#include <libavfilter/avfilter.h>
+#include <libavfilter/buffersink.h>
+#include <libavfilter/buffersrc.h>
+#include <libavutil/channel_layout.h>
+#include <libavutil/opt.h>
+#include <libswresample/swresample.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define MAX_PIDS 8192
+#define MAX_CH 64
+#define GPS_EPOCH_UNIX 315964800LL       // 1980-01-06 00:00:00 UTC
+
+typedef struct {
+    uint8_t buf[4096 + 188];
+    int len, need;                        // bytes collected, total section length (0 = unknown)
+    int active;
+} section_buf;
+
+typedef struct {
+    uint8_t *buf; int len, cap;
+    int64_t pts;
+    int started;
+} pes_buf;
+
+struct atsc_media {
+    atsc_media_cb cb;
+
+    // PSI / PSIP
+    section_buf *sec[MAX_PIDS];           // allocated on demand for table PIDs
+    uint8_t is_table[MAX_PIDS];           // 1 PAT, 2 PMT, 3 PSIP base, 4 EIT
+    int pmt_pid_of_program[65536 / 8];    // small map: program -> pmt pid (index by program & mask)
+    int prog_list[MAX_CH], prog_pmt[MAX_CH], nprog;
+    int pat_version, tvct_version;
+    atsc_vchannel ch[MAX_CH]; int nch;
+    int gps_utc_offset; int have_offset;
+
+    // selected program
+    int want_program, cur_program;
+    int video_pid, audio_pid;
+    pes_buf vpes, apes;
+
+    // FFmpeg
+    AVCodecParserContext *vparser, *aparser;
+    AVCodecContext *vdec, *adec;
+    AVFrame *frame, *filt;
+    AVPacket *pkt;
+    AVFilterGraph *graph; AVFilterContext *src, *sink;
+    int g_w, g_h, g_fmt, g_sn, g_sd;
+    SwrContext *swr; int swr_in_ch, swr_rate, swr_fmt;
+    float *abuf; int abuf_cap;
+    int fmt_w, fmt_h, fmt_i, fmt_ach;
+
+    uint64_t dropped;
+};
+
+// ----------------------------------------------------------------------------- utilities
+
+static uint32_t crc32_mpeg(const uint8_t *d, int n) {
+    uint32_t c = 0xFFFFFFFF;
+    for (int i = 0; i < n; i++) {
+        c ^= (uint32_t)d[i] << 24;
+        for (int b = 0; b < 8; b++) c = (c & 0x80000000) ? (c << 1) ^ 0x04C11DB7 : c << 1;
+    }
+    return c;
+}
+
+static void utf8_put(char **o, char *end, uint32_t cp) {
+    if (cp < 0x80) { if (*o < end) *(*o)++ = (char)cp; }
+    else if (cp < 0x800) { if (*o + 1 < end) { *(*o)++ = (char)(0xC0 | (cp >> 6)); *(*o)++ = (char)(0x80 | (cp & 0x3F)); } }
+    else { if (*o + 2 < end) { *(*o)++ = (char)(0xE0 | (cp >> 12)); *(*o)++ = (char)(0x80 | ((cp >> 6) & 0x3F)); *(*o)++ = (char)(0x80 | (cp & 0x3F)); } }
+}
+
+// A/65 multiple_string_structure -> first string, UTF-8. Uncompressed segments only
+// (compression type 0); Huffman-coded segments are skipped.
+static void mss_to_utf8(const uint8_t *p, int len, char *out, int cap) {
+    char *o = out, *end = out + cap - 1;
+    if (len < 1) { *o = 0; return; }
+    int nstr = p[0]; int i = 1;
+    for (int s = 0; s < nstr && s < 1; s++) {
+        if (i + 4 > len) break;
+        int nseg = p[i + 3]; i += 4;
+        for (int g = 0; g < nseg; g++) {
+            if (i + 3 > len) break;
+            int comp = p[i], mode = p[i + 1], nb = p[i + 2]; i += 3;
+            if (i + nb > len) break;
+            if (comp == 0) {
+                if (mode == 0x3F) {                         // UTF-16
+                    for (int k = 0; k + 1 < nb; k += 2) utf8_put(&o, end, (uint32_t)p[i + k] << 8 | p[i + k + 1]);
+                } else if (mode <= 0x06 || (mode >= 0x09 && mode <= 0x10) || (mode >= 0x20 && mode <= 0x27) || (mode >= 0x30 && mode <= 0x33)) {
+                    for (int k = 0; k < nb; k++) utf8_put(&o, end, ((uint32_t)mode << 8) | p[i + k]);
+                }
+            }
+            i += nb;
+        }
+    }
+    *o = 0;
+}
+
+// ----------------------------------------------------------------------------- tables
+
+static void set_table_pid(atsc_media *m, int pid, int kind) {
+    if (pid < 0 || pid >= MAX_PIDS) return;
+    if (!m->sec[pid]) m->sec[pid] = calloc(1, sizeof(section_buf));
+    m->is_table[pid] = (uint8_t)kind;
+}
+
+static void select_streams(atsc_media *m);
+
+static void parse_pat(atsc_media *m, const uint8_t *s, int len) {
+    int ver = (s[5] >> 1) & 0x1F;
+    if (ver == m->pat_version) return;
+    m->pat_version = ver;
+    m->nprog = 0;
+    for (int i = 8; i + 4 <= len - 4; i += 4) {
+        int prog = s[i] << 8 | s[i + 1];
+        int pid = (s[i + 2] & 0x1F) << 8 | s[i + 3];
+        if (prog == 0) continue;               // network PID
+        if (m->nprog < MAX_CH) { m->prog_list[m->nprog] = prog; m->prog_pmt[m->nprog] = pid; m->nprog++; }
+        set_table_pid(m, pid, 2);
+    }
+    select_streams(m);
+}
+
+typedef struct { int prog, video, audio, achan; } pmt_info;
+static pmt_info pmts[MAX_CH]; static int npmt;       // per-media would be cleaner; one instance in practice
+
+static void parse_pmt(atsc_media *m, const uint8_t *s, int len) {
+    int prog = s[3] << 8 | s[4];
+    int pinfo = (s[10] & 0x0F) << 8 | s[11];
+    int i = 12 + pinfo;
+    pmt_info pi = {prog, 0, 0, 0};
+    while (i + 5 <= len - 4) {
+        int type = s[i], pid = (s[i + 1] & 0x1F) << 8 | s[i + 2];
+        int eslen = (s[i + 3] & 0x0F) << 8 | s[i + 4];
+        if ((type == 0x02 || type == 0x01) && !pi.video) pi.video = pid;
+        if ((type == 0x81 || type == 0x87) && !pi.audio) pi.audio = pid;
+        i += 5 + eslen;
+    }
+    int k = 0;
+    for (; k < npmt; k++) if (pmts[k].prog == prog) break;
+    if (k == npmt && npmt < MAX_CH) npmt++;
+    if (k < MAX_CH) pmts[k] = pi;
+    select_streams(m);
+}
+
+static void parse_mgt(atsc_media *m, const uint8_t *s, int len) {
+    int n = s[9] << 8 | s[10];
+    int i = 11;
+    for (int t = 0; t < n && i + 11 <= len - 4; t++) {
+        int type = s[i] << 8 | s[i + 1];
+        int pid = (s[i + 2] & 0x1F) << 8 | s[i + 3];
+        int dlen = (s[i + 9] & 0x0F) << 8 | s[i + 10];
+        if (type >= 0x0100 && type <= 0x017F) set_table_pid(m, pid, 4);   // EIT-0 .. EIT-127
+        i += 11 + dlen;
+    }
+}
+
+static void parse_vct(atsc_media *m, const uint8_t *s, int len) {
+    int ver = (s[5] >> 1) & 0x1F;
+    int sec = s[6];
+    if (sec == 0 && ver == m->tvct_version) return;
+    if (sec == 0) { m->tvct_version = ver; m->nch = 0; }
+    int n = s[9];
+    int i = 10;
+    for (int c = 0; c < n && i + 32 <= len - 4; c++) {
+        atsc_vchannel v = {0};
+        char *o = v.name, *end = v.name + sizeof v.name - 1;
+        for (int k = 0; k < 7; k++) {
+            uint32_t cp = (uint32_t)s[i + 2 * k] << 8 | s[i + 2 * k + 1];
+            if (cp) utf8_put(&o, end, cp);
+        }
+        *o = 0;
+        v.major = ((s[i + 14] & 0x0F) << 6) | (s[i + 15] >> 2);
+        v.minor = ((s[i + 15] & 0x03) << 8) | s[i + 16];
+        v.program = s[i + 24] << 8 | s[i + 25];
+        v.hidden = (s[i + 26] >> 4) & 1;
+        v.service_type = s[i + 27] & 0x3F;
+        v.source_id = s[i + 28] << 8 | s[i + 29];
+        int dlen = (s[i + 30] & 0x03) << 8 | s[i + 31];
+        if (m->nch < MAX_CH) m->ch[m->nch++] = v;
+        i += 32 + dlen;
+    }
+    if (s[6] == s[7] && m->cb.channels) m->cb.channels(m->cb.ctx, m->ch, m->nch);   // last section
+}
+
+static void parse_eit(atsc_media *m, const uint8_t *s, int len) {
+    int source = s[3] << 8 | s[4];
+    int n = s[9];
+    int i = 10;
+    for (int e = 0; e < n && i + 10 <= len - 4; e++) {
+        atsc_event ev = {0};
+        ev.source_id = source;
+        ev.event_id = ((s[i] & 0x3F) << 8) | s[i + 1];
+        uint32_t start = (uint32_t)s[i + 2] << 24 | s[i + 3] << 16 | s[i + 4] << 8 | s[i + 5];
+        ev.duration = ((s[i + 6] & 0x0F) << 16) | s[i + 7] << 8 | s[i + 8];
+        int tlen = s[i + 9];
+        if (i + 10 + tlen + 2 > len - 4) break;
+        mss_to_utf8(s + i + 10, tlen, ev.title, sizeof ev.title);
+        ev.start_utc = GPS_EPOCH_UNIX + start - (m->have_offset ? m->gps_utc_offset : 18);
+        int dlen = (s[i + 10 + tlen] & 0x0F) << 8 | s[i + 11 + tlen];
+        if (m->cb.event) m->cb.event(m->cb.ctx, &ev);
+        i += 12 + tlen + dlen;
+    }
+}
+
+static void parse_stt(atsc_media *m, const uint8_t *s, int len) {
+    if (len < 17) return;
+    uint32_t gps = (uint32_t)s[9] << 24 | s[10] << 16 | s[11] << 8 | s[12];
+    m->gps_utc_offset = s[13]; m->have_offset = 1;
+    if (m->cb.time) m->cb.time(m->cb.ctx, GPS_EPOCH_UNIX + gps - m->gps_utc_offset);
+}
+
+static void handle_section(atsc_media *m, int pid, const uint8_t *s, int len) {
+    int syntax = s[1] & 0x80;
+    if (syntax && crc32_mpeg(s, len) != 0) return;     // corrupted
+    int tid = s[0];
+    int kind = m->is_table[pid];
+    if (kind == 1 && tid == 0x00) parse_pat(m, s, len);
+    else if (kind == 2 && tid == 0x02) parse_pmt(m, s, len);
+    else if (kind == 3 && tid == 0xC7) parse_mgt(m, s, len);
+    else if (kind == 3 && (tid == 0xC8 || tid == 0xC9)) parse_vct(m, s, len);
+    else if (kind == 3 && tid == 0xCD) parse_stt(m, s, len);
+    else if (kind == 4 && tid == 0xCB) parse_eit(m, s, len);
+}
+
+static void section_packet(atsc_media *m, int pid, const uint8_t *p, int n, int pusi) {
+    section_buf *sb = m->sec[pid];
+    if (!sb) return;
+    int i = 0;
+    if (pusi) {
+        int ptr = p[0]; i = 1;
+        if (sb->active && ptr > 0 && i + ptr <= n) {   // tail of the previous section
+            memcpy(sb->buf + sb->len, p + i, ptr); sb->len += ptr;
+            if (sb->need && sb->len >= sb->need) handle_section(m, pid, sb->buf, sb->need);
+        }
+        i += ptr; sb->active = 1; sb->len = 0; sb->need = 0;
+    } else if (!sb->active) return;
+    while (i < n) {
+        if (sb->len == 0 && p[i] == 0xFF) { sb->active = 0; return; }     // stuffing
+        int take = n - i;
+        if (sb->len + take > (int)sizeof sb->buf) { sb->active = 0; return; }
+        memcpy(sb->buf + sb->len, p + i, take); sb->len += take; i += take;
+        while (1) {
+            if (!sb->need && sb->len >= 3) sb->need = 3 + (((sb->buf[1] & 0x0F) << 8) | sb->buf[2]);
+            if (!sb->need || sb->len < sb->need) break;
+            handle_section(m, pid, sb->buf, sb->need);
+            int rest = sb->len - sb->need;
+            memmove(sb->buf, sb->buf + sb->need, rest);
+            sb->len = rest; sb->need = 0;
+            if (rest == 0 || sb->buf[0] == 0xFF) { sb->len = 0; break; }
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------- decoding
+
+static void close_decoders(atsc_media *m) {
+    if (m->vparser) av_parser_close(m->vparser);
+    if (m->aparser) av_parser_close(m->aparser);
+    avcodec_free_context(&m->vdec); avcodec_free_context(&m->adec);
+    avfilter_graph_free(&m->graph); m->src = m->sink = NULL; m->g_w = 0;
+    swr_free(&m->swr); m->swr_in_ch = 0;
+    m->vparser = m->aparser = NULL;
+    m->vpes.started = m->apes.started = 0; m->vpes.len = m->apes.len = 0;
+    m->fmt_w = m->fmt_h = m->fmt_ach = -1;
+}
+
+static void open_decoders(atsc_media *m) {
+    close_decoders(m);
+    const AVCodec *vc = avcodec_find_decoder(AV_CODEC_ID_MPEG2VIDEO);
+    const AVCodec *ac = avcodec_find_decoder(AV_CODEC_ID_AC3);
+    m->vdec = avcodec_alloc_context3(vc);
+    m->vdec->thread_count = 4;
+    m->vdec->pkt_timebase = (AVRational){1, 90000};
+    avcodec_open2(m->vdec, vc, NULL);
+    m->adec = avcodec_alloc_context3(ac);
+    m->adec->pkt_timebase = (AVRational){1, 90000};
+    avcodec_open2(m->adec, ac, NULL);
+    m->vparser = av_parser_init(AV_CODEC_ID_MPEG2VIDEO);
+    m->aparser = av_parser_init(AV_CODEC_ID_AC3);
+}
+
+static void select_streams(atsc_media *m) {
+    int prog = m->want_program;
+    if (!prog && m->nprog) prog = m->prog_list[0];
+    for (int k = 0; k < npmt; k++) {
+        if (pmts[k].prog != prog) continue;
+        if (prog == m->cur_program && pmts[k].video == m->video_pid && pmts[k].audio == m->audio_pid) return;
+        m->cur_program = prog;
+        m->video_pid = pmts[k].video; m->audio_pid = pmts[k].audio;
+        open_decoders(m);
+        return;
+    }
+}
+
+static int build_graph(atsc_media *m, AVFrame *f) {
+    avfilter_graph_free(&m->graph);
+    m->graph = avfilter_graph_alloc();
+    char args[256];
+    AVRational sar = f->sample_aspect_ratio.num ? f->sample_aspect_ratio : (AVRational){1, 1};
+    snprintf(args, sizeof args, "video_size=%dx%d:pix_fmt=%d:time_base=1/90000:pixel_aspect=%d/%d:colorspace=%d:range=%d",
+             f->width, f->height, f->format, sar.num, sar.den, f->colorspace, f->color_range);
+    if (avfilter_graph_create_filter(&m->src, avfilter_get_by_name("buffer"), "in", args, NULL, m->graph) < 0) return -1;
+    if (avfilter_graph_create_filter(&m->sink, avfilter_get_by_name("buffersink"), "out", NULL, NULL, m->graph) < 0) return -1;
+    AVFilterInOut *outs = avfilter_inout_alloc(), *ins = avfilter_inout_alloc();
+    outs->name = av_strdup("in"); outs->filter_ctx = m->src; outs->pad_idx = 0; outs->next = NULL;
+    ins->name = av_strdup("out"); ins->filter_ctx = m->sink; ins->pad_idx = 0; ins->next = NULL;
+    // bwdif: motion-adaptive deinterlacing, one output frame per input frame; progressive frames pass through
+    int r = avfilter_graph_parse_ptr(m->graph, "bwdif=mode=send_frame:parity=auto:deint=interlaced,format=yuv420p", &ins, &outs, NULL);
+    avfilter_inout_free(&ins); avfilter_inout_free(&outs);
+    if (r < 0 || avfilter_graph_config(m->graph, NULL) < 0) return -1;
+    m->g_w = f->width; m->g_h = f->height; m->g_fmt = f->format; m->g_sn = sar.num; m->g_sd = sar.den;
+    return 0;
+}
+
+static void emit_video(atsc_media *m, AVFrame *f) {
+    if (m->cb.video)
+        m->cb.video(m->cb.ctx, f->data[0], f->data[1], f->data[2], f->linesize[0], f->linesize[1],
+                    f->width, f->height, f->sample_aspect_ratio.num ? f->sample_aspect_ratio.num : 1,
+                    f->sample_aspect_ratio.den ? f->sample_aspect_ratio.den : 1, f->pts);
+}
+
+static void decode_video(atsc_media *m, AVPacket *pk) {
+    if (avcodec_send_packet(m->vdec, pk) < 0) return;
+    while (avcodec_receive_frame(m->vdec, m->frame) == 0) {
+        AVFrame *f = m->frame;
+        f->pts = f->best_effort_timestamp;
+        int interlaced = (f->flags & AV_FRAME_FLAG_INTERLACED) != 0;
+        if (m->fmt_w != f->width || m->fmt_h != f->height || m->fmt_i != interlaced) {
+            m->fmt_w = f->width; m->fmt_h = f->height; m->fmt_i = interlaced;
+            if (m->cb.format) m->cb.format(m->cb.ctx, f->width, f->height, interlaced, m->fmt_ach);
+        }
+        AVRational sar = f->sample_aspect_ratio.num ? f->sample_aspect_ratio : (AVRational){1, 1};
+        if (!m->graph || f->width != m->g_w || f->height != m->g_h || f->format != m->g_fmt ||
+            sar.num != m->g_sn || sar.den != m->g_sd) {
+            if (build_graph(m, f) < 0) { emit_video(m, f); av_frame_unref(f); continue; }
+        }
+        if (av_buffersrc_add_frame_flags(m->src, f, AV_BUFFERSRC_FLAG_KEEP_REF) >= 0) {
+            while (av_buffersink_get_frame(m->sink, m->filt) >= 0) {
+                emit_video(m, m->filt);
+                av_frame_unref(m->filt);
+            }
+        }
+        av_frame_unref(f);
+    }
+}
+
+static void decode_audio(atsc_media *m, AVPacket *pk) {
+    if (avcodec_send_packet(m->adec, pk) < 0) return;
+    while (avcodec_receive_frame(m->adec, m->frame) == 0) {
+        AVFrame *f = m->frame;
+        int ch = f->ch_layout.nb_channels;
+        if (ch != m->fmt_ach) {
+            m->fmt_ach = ch;
+            if (m->cb.format && m->fmt_w > 0) m->cb.format(m->cb.ctx, m->fmt_w, m->fmt_h, m->fmt_i, ch);
+        }
+        if (!m->swr || ch != m->swr_in_ch || f->sample_rate != m->swr_rate || f->format != m->swr_fmt) {
+            swr_free(&m->swr);
+            AVChannelLayout out = AV_CHANNEL_LAYOUT_STEREO;
+            swr_alloc_set_opts2(&m->swr, &out, AV_SAMPLE_FMT_FLT, f->sample_rate,
+                                &f->ch_layout, f->format, f->sample_rate, 0, NULL);
+            if (!m->swr || swr_init(m->swr) < 0) { swr_free(&m->swr); av_frame_unref(f); continue; }
+            m->swr_in_ch = ch; m->swr_rate = f->sample_rate; m->swr_fmt = f->format;
+        }
+        int outn = swr_get_out_samples(m->swr, f->nb_samples);
+        if (outn * 2 > m->abuf_cap) { m->abuf_cap = outn * 2; m->abuf = realloc(m->abuf, sizeof(float) * m->abuf_cap); }
+        uint8_t *outp[1] = {(uint8_t *)m->abuf};
+        int got = swr_convert(m->swr, outp, outn, (const uint8_t **)f->extended_data, f->nb_samples);
+        if (got > 0 && m->cb.audio) m->cb.audio(m->cb.ctx, m->abuf, got, f->sample_rate, f->pts);
+        av_frame_unref(f);
+    }
+}
+
+static void parse_es(atsc_media *m, int video, const uint8_t *d, int n, int64_t pts) {
+    AVCodecParserContext *p = video ? m->vparser : m->aparser;
+    AVCodecContext *c = video ? m->vdec : m->adec;
+    if (!p || !c) return;
+    while (n > 0) {
+        uint8_t *out; int outn;
+        int used = av_parser_parse2(p, c, &out, &outn, d, n, pts, pts, 0);
+        pts = AV_NOPTS_VALUE;
+        d += used; n -= used;
+        if (outn) {
+            m->pkt->data = out; m->pkt->size = outn;
+            m->pkt->pts = p->pts; m->pkt->dts = p->dts;
+            if (video) decode_video(m, m->pkt); else decode_audio(m, m->pkt);
+        }
+        if (used == 0 && outn == 0) break;
+    }
+}
+
+static void pes_packet(atsc_media *m, int video, const uint8_t *p, int n, int pusi) {
+    pes_buf *pb = video ? &m->vpes : &m->apes;
+    int64_t pts = AV_NOPTS_VALUE;
+    if (pusi) {
+        if (n < 9 || p[0] != 0 || p[1] != 0 || p[2] != 1) { pb->started = 0; return; }
+        int hlen = p[8];
+        if ((p[7] & 0x80) && n >= 14) {
+            pts = ((int64_t)(p[9] & 0x0E) << 29) | ((int64_t)p[10] << 22) | ((int64_t)(p[11] & 0xFE) << 14) |
+                  ((int64_t)p[12] << 7) | (p[13] >> 1);
+        }
+        if (9 + hlen > n) { pb->started = 0; return; }
+        p += 9 + hlen; n -= 9 + hlen;
+        pb->started = 1;
+    } else if (!pb->started) return;
+    parse_es(m, video, p, n, pts);
+}
+
+// ----------------------------------------------------------------------------- public
+
+atsc_media *atsc_media_create(const atsc_media_cb *cb) {
+    av_log_set_level(AV_LOG_FATAL);           // missing-reference noise before the first I-frame is normal
+    atsc_media *m = calloc(1, sizeof *m);
+    m->cb = *cb;
+    m->frame = av_frame_alloc(); m->filt = av_frame_alloc(); m->pkt = av_packet_alloc();
+    atsc_media_reset(m);
+    return m;
+}
+
+void atsc_media_destroy(atsc_media *m) {
+    if (!m) return;
+    close_decoders(m);
+    for (int i = 0; i < MAX_PIDS; i++) free(m->sec[i]);
+    av_frame_free(&m->frame); av_frame_free(&m->filt); av_packet_free(&m->pkt);
+    free(m->abuf);
+    free(m);
+}
+
+void atsc_media_reset(atsc_media *m) {
+    close_decoders(m);
+    for (int i = 0; i < MAX_PIDS; i++) { free(m->sec[i]); m->sec[i] = NULL; m->is_table[i] = 0; }
+    set_table_pid(m, 0x0000, 1);
+    set_table_pid(m, 0x1FFB, 3);
+    m->pat_version = m->tvct_version = -1;
+    m->nprog = 0; m->nch = 0; npmt = 0;
+    m->cur_program = -1; m->video_pid = m->audio_pid = -1;
+}
+
+void atsc_media_select(atsc_media *m, int program) {
+    m->want_program = program;
+    select_streams(m);
+}
+
+void atsc_media_push(atsc_media *m, const uint8_t *pk, int ok) {
+    if (!ok || pk[0] != 0x47 || (pk[1] & 0x80)) { m->dropped++; return; }
+    int pid = (pk[1] & 0x1F) << 8 | pk[2];
+    int pusi = pk[1] & 0x40;
+    int afc = (pk[3] >> 4) & 3;
+    int i = 4;
+    if (afc == 2 || afc == 0) return;               // no payload
+    if (afc == 3) { i += 1 + pk[4]; if (i >= 188) return; }
+    const uint8_t *p = pk + i; int n = 188 - i;
+    if (m->sec[pid]) section_packet(m, pid, p, n, pusi);
+    else if (pid == m->video_pid) pes_packet(m, 1, p, n, pusi);
+    else if (pid == m->audio_pid) pes_packet(m, 0, p, n, pusi);
+}
