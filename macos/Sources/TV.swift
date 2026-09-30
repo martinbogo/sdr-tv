@@ -587,7 +587,12 @@ final class TV: ObservableObject {
         captionChoices.first { $0.service == captionService }?.label ?? (captionService == 0 ? "Off" : "On")
     }
 
+    private var ccCount = 0, ccText = 0
     private func showCaptions(_ json: String) {
+        if ProcessInfo.processInfo.environment["ATSC_DEBUG"] != nil {
+            ccCount += 1; if json.contains("\"lines\"") { ccText += 1 }
+            if ccCount % 20 == 1 { FileHandle.standardError.write("captions: \(ccCount) screens, \(ccText) with text, service \(captionService): \(json.prefix(120))\n".data(using: .utf8)!) }
+        }
         guard captionService != 0, let d = json.data(using: .utf8),
               let screen = try? JSONDecoder().decode(CaptionScreen.self, from: d) else {
             if captionService == 0 { captionRegions = [] }
