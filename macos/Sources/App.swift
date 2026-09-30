@@ -10,7 +10,6 @@ struct ATSCReceiverApp: App {
             TVScreen()
                 .environmentObject(tv)
                 .frame(minWidth: 480, minHeight: 270)
-                .aspectRatio(16.0 / 9.0, contentMode: .fit)
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1280, height: 720)
@@ -48,7 +47,7 @@ struct TVCommands: Commands {
                 ForEach(tv.channels) { ch in Button("\(ch.number)  \(ch.name)") { tv.tune(ch) } }
             }
             Divider()
-            Button(tv.scanning ? "Stop Scanning" : "Scan for Channels…") { tv.scanning ? tv.cancelScan() : tv.scan() }
+            Button("Scan for Channels…") { tv.beginSetup() }.disabled(tv.scanning)
         }
         CommandMenu("Controls") {
             Button("Volume Up") { tv.changeVolume(0.05) }.keyboardShortcut(.rightArrow, modifiers: .command)

@@ -30,7 +30,7 @@ struct TVScreen: View {
         ZStack {
             Color.black
             VideoSurface(layer: tv.engine.player.layer)
-                .opacity(tv.hasPicture ? 1 : 0)
+                .opacity(tv.hasPicture && !tv.scanning && !tv.setupVisible ? 1 : 0)
             idleMessage
             VStack(spacing: 0) {
                 HStack(alignment: .top) {
@@ -66,8 +66,11 @@ struct TVScreen: View {
         .focusable()
         .focusEffectDisabled()
         .focused($focused)
-        .onAppear { focused = true; DispatchQueue.main.async { tv.setWindowButtons(visible: false) } }
+        .onAppear { focused = true; DispatchQueue.main.async { tv.configureWindow(); tv.setWindowButtons(visible: false) } }
         .onKeyPress(phases: .down) { press in handle(press) }
+        .sheet(isPresented: $tv.setupVisible) {
+            SetupSheet().environmentObject(tv).interactiveDismissDisabled()
+        }
     }
 
     @ViewBuilder private var idleMessage: some View {
@@ -79,7 +82,7 @@ struct TVScreen: View {
                     .font(.callout).foregroundStyle(.secondary)
             }
             .foregroundStyle(.white.opacity(0.85))
-        } else if !tv.hasPicture, !tv.scanning, let ch = tv.current {
+        } else if !tv.hasPicture, !tv.scanning, !tv.setupVisible, let ch = tv.current {
             VStack(spacing: 8) {
                 if tv.stats.state == ATSC_LOCKED { ProgressView().controlSize(.large).tint(.white) }
                 else { Image(systemName: "antenna.radiowaves.left.and.right.slash").font(.system(size: 40)) }
@@ -109,7 +112,7 @@ struct TVScreen: View {
             case "l": tv.recall()
             case "r": tv.toggleRecording()
             case "f": NSApp.keyWindow?.toggleFullScreen(nil)
-            case "s": tv.scan()
+            case "s": tv.beginSetup()
             default: return .ignored
             }
         }
@@ -487,7 +490,7 @@ struct ChannelSettings: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Button(tv.scanning ? "Stop Scan" : "Scan for Channels…") { tv.scanning ? tv.cancelScan() : tv.scan() }
+                Button("Scan for Channels…") { tv.beginSetup() }.disabled(tv.scanning)
                 if tv.scanning { ProgressView(value: tv.scanProgress).frame(width: 180) }
                 Spacer()
                 Text("\(tv.channels.count) channels").foregroundStyle(.secondary)
@@ -519,4 +522,86 @@ struct RecordingSettings: View {
         }
         .formStyle(.grouped)
     }
+}
+
+// MARK: - setup / scan window
+
+/// Shown on first launch (and for rescans): scans every RF channel with the picture hidden,
+/// then saves the channel list for later launches.
+struct SetupSheet: View {
+    @EnvironmentObject var tv: TV
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 14) {
+                Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 56, height: 56)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(tv.firstRun ? "Welcome to ATSC Receiver" : "Scan for Channels").font(.title2.weight(.semibold))
+                    Text(subtitle).foregroundStyle(.secondary)
+                }
+            }
+            if let err = tv.deviceError {
+                Label(err, systemImage: "cable.connector.slash").foregroundStyle(.orange)
+                Text("Connect the HackRF (with the PortaPack in HackRF mode) and a TV antenna. The scan starts as soon as it is detected.")
+                    .font(.callout).foregroundStyle(.secondary)
+            } else {
+                VStack(alignment: .leading, spacing: 6) {
+                    ProgressView(value: tv.scanFinished ? 1 : tv.scanProgress)
+                    Text(progressText).font(.callout).foregroundStyle(.secondary).monospacedDigit()
+                }
+                List(tv.scanResults) { ch in
+                    HStack {
+                        Text(ch.number).monospacedDigit().frame(width: 56, alignment: .leading)
+                        Text(ch.name)
+                        Spacer()
+                        Text("RF \(ch.rf)").foregroundStyle(.secondary).monospacedDigit()
+                        SignalBars(bars: bars(ch.signalDB)).environment(\.colorScheme, .dark)
+                            .padding(4).background(Color.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 4))
+                    }
+                }
+                .frame(minHeight: 220)
+                .overlay {
+                    if tv.scanResults.isEmpty {
+                        Text(tv.scanFinished ? "No channels found" : "Stations will appear here as they are found")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                if tv.scanFinished && tv.scanResults.isEmpty {
+                    Text("Check that the antenna is connected and try another position (near a window helps). For distant stations, turn on the RF amplifier in Settings.")
+                        .font(.callout).foregroundStyle(.secondary)
+                }
+            }
+            HStack {
+                if tv.scanning {
+                    Button("Stop") { tv.cancelScan() }
+                } else if tv.scanFinished && tv.scanResults.isEmpty || tv.deviceError == nil && !tv.scanFinished {
+                    Button("Scan Again") { tv.beginSetup() }.disabled(tv.deviceError != nil)
+                }
+                Spacer()
+                if !tv.firstRun && !tv.scanning {
+                    Button("Close") { tv.finishSetup() }
+                }
+                Button("Start Watching") { tv.finishSetup() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(tv.scanning || tv.channels.isEmpty)
+            }
+        }
+        .padding(24)
+        .frame(width: 520)
+    }
+
+    private var subtitle: String {
+        if tv.deviceError != nil { return "Waiting for the HackRF" }
+        if tv.scanning { return "Finding the TV stations your antenna receives. This takes about two minutes." }
+        if tv.scanResults.isEmpty { return "The scan found no digital TV stations." }
+        return "Found \(tv.scanResults.count) channels. They are saved, so this runs only once."
+    }
+
+    private var progressText: String {
+        if tv.scanFinished { return "Scan complete" }
+        if tv.scanRF == 0 { return "Starting…" }
+        return "RF channel \(tv.scanRF) (\(Int(RFBand.centerMHz(tv.scanRF))) MHz) · \(tv.scanResults.count) found"
+    }
+
+    private func bars(_ snr: Double) -> Int { snr < 15 ? 1 : snr < 18 ? 2 : snr < 21 ? 3 : 4 }
 }

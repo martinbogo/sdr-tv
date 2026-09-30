@@ -37,6 +37,11 @@ final class TV: ObservableObject {
     @Published var status: String?                  // transient message (top)
     @Published private(set) var scanning = false
     @Published private(set) var scanProgress = 0.0
+    @Published private(set) var scanRF = 0
+    @Published private(set) var scanResults: [VirtualChannel] = []
+    @Published private(set) var scanFinished = false
+    @Published var setupVisible = false             // modal scan window (first run, or a rescan)
+    var firstRun: Bool { !defaults.bool(forKey: "initialScanDone") }
     @Published private(set) var recordingSince: Date?
 
     private var bannerTimer: DispatchWorkItem?
@@ -84,11 +89,26 @@ final class TV: ObservableObject {
         do {
             try engine.open(rf: rf, amp: ampOn, lna: lna, vga: vga)
             deviceError = nil
-            if let start { tune(start, showBanner: true) }
-            else if !scanning { flash("No channels yet. Press S or choose Channel > Scan for Channels.", seconds: 8) }
+            if firstRun || channels.isEmpty { beginSetup() }
+            else if let start, !setupVisible { tune(start, showBanner: true) }
         } catch {
             deviceError = error.localizedDescription
+            if firstRun { setupVisible = true }      // the setup window explains what is missing
         }
+    }
+
+    /// Show the scan window and start scanning (first run, or Channel > Scan for Channels).
+    func beginSetup() {
+        setupVisible = true
+        scanFinished = false
+        scanResults = []
+        if deviceError == nil { scan() }
+    }
+
+    /// Close the scan window and start watching.
+    func finishSetup() {
+        setupVisible = false
+        if let first = lastWatched() ?? channels.first { current = nil; tune(first) }
     }
 
     private func lastWatched() -> VirtualChannel? {
@@ -168,20 +188,21 @@ final class TV: ObservableObject {
 
     func scan() {
         guard !scanning, deviceError == nil else { return }
-        scanning = true; scanProgress = 0; scanCancel = false
-        guideVisible = false
+        scanning = true; scanProgress = 0; scanCancel = false; scanFinished = false; scanResults = []
+        guideVisible = false; bannerVisible = false
+        hasPicture = false
         let rfs = RFBand.channels
-        var found: [VirtualChannel] = []
         let engine = self.engine
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var found: [VirtualChannel] = []
             for (i, rf) in rfs.enumerated() {
                 guard let self, !self.scanCancel else { break }
                 DispatchQueue.main.sync {
                     self.scanProgress = Double(i) / Double(rfs.count)
-                    self.status = "Scanning RF \(rf) (\(Int(RFBand.centerMHz(rf))) MHz) · \(found.count) channels found"
+                    self.scanRF = rf
                     self.scanFound = []
                     engine.tune(rf: rf)
-                    engine.select(program: 0)
+                    engine.select(program: -1)             // demodulate and read tables, decode nothing
                 }
                 // wait for 8VSB lock, then for the virtual channel table
                 var locked = false
@@ -203,16 +224,24 @@ final class TV: ObservableObject {
                 if !got.isEmpty { Thread.sleep(forTimeInterval: 1.5) }
                 let list = got.filter { $0.rf == rf }.map { c -> VirtualChannel in var c = c; c.signalDB = snr; return c }
                 found.append(contentsOf: list)
-                DispatchQueue.main.sync { self.library.merge(rf: rf, found: list) }
+                DispatchQueue.main.sync {
+                    self.scanResults = found.filter { !$0.hidden }.sorted { ($0.major, $0.minor) < ($1.major, $1.minor) }
+                }
             }
             DispatchQueue.main.async {
                 guard let self else { return }
+                let completed = !self.scanCancel
                 self.scanning = false
-                self.channels = self.library.visibleChannels
+                self.scanProgress = 1
+                self.scanFinished = true
+                if completed || !found.isEmpty {
+                    // a finished scan replaces the list; keep the user's hidden choices
+                    self.library.replaceAll(found, keepingHiddenFrom: self.library.channels)
+                    self.channels = self.library.visibleChannels
+                }
                 self.library.save()
-                self.flash(found.isEmpty ? "No channels found. Check the antenna and gain in Settings."
-                                         : "Found \(found.count) channels", seconds: 5)
-                if let first = self.lastWatched() ?? self.channels.first { self.current = nil; self.tune(first) }
+                if !found.isEmpty { self.defaults.set(true, forKey: "initialScanDone") }
+                if !self.setupVisible, let first = self.lastWatched() ?? self.channels.first { self.current = nil; self.tune(first) }
             }
         }
     }
@@ -258,6 +287,14 @@ final class TV: ObservableObject {
         }
         controlsTimer = t
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: t)
+    }
+
+    /// TV-style window: black behind the picture, resizing locked to 16:9.
+    func configureWindow() {
+        guard let w = NSApp.windows.first(where: { $0.isVisible && $0.styleMask.contains(.titled) && !($0 is NSPanel) }) else { return }
+        w.backgroundColor = .black
+        w.contentAspectRatio = NSSize(width: 16, height: 9)
+        w.isMovableByWindowBackground = true
     }
 
     func setWindowButtons(visible: Bool) {

@@ -83,6 +83,12 @@ final class Library {
         setChannels(list)
     }
 
+    /// Replace the whole list with a fresh scan, keeping which channels the user hid.
+    func replaceAll(_ found: [VirtualChannel], keepingHiddenFrom old: [VirtualChannel]) {
+        let hiddenIDs = Set(old.filter { $0.hidden }.map(\.id))
+        setChannels(found.map { var c = $0; c.hidden = c.hidden || hiddenIDs.contains(c.id); return c })
+    }
+
     func setHidden(_ id: String, _ hidden: Bool) {
         if let i = channels.firstIndex(where: { $0.id == id }) { channels[i].hidden = hidden; save() }
     }
