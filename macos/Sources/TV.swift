@@ -452,13 +452,13 @@ final class TV: ObservableObject {
 
     static var recordingsFolder: URL {
         FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("ATSC Receiver", isDirectory: true)
+            .appendingPathComponent("SDR TV", isDirectory: true)
     }
 
     func toggleRecording() {
         if recordingSince != nil {
             engine.stopRecording(); recordingSince = nil
-            flash("Recording saved to Movies/ATSC Receiver")
+            flash("Recording saved to Movies/SDR TV")
             return
         }
         guard let ch = current, hasPicture else { flash("Nothing to record yet"); return }

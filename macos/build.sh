@@ -1,5 +1,5 @@
 #!/bin/bash
-# Builds "ATSC Receiver.app": a self-contained Apple Silicon app with the 8VSB receiver (C),
+# Builds "SDR TV.app": a self-contained Apple Silicon app with the 8VSB receiver (C),
 # a minimal LGPL FFmpeg, libhackrf and libusb all linked statically.
 #   Requires: Xcode command line tools, `brew install hackrf`, and third_party/ffmpeg-install
 #   (see ../third_party/build_ffmpeg.sh).
@@ -8,7 +8,7 @@ cd "$(dirname "$0")"
 
 BREW="$(brew --prefix)"
 FF="../third_party/ffmpeg-install"
-APP="build/ATSC Receiver.app"
+APP="build/SDR TV.app"
 OBJ="build/obj"
 rm -rf build
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$OBJ"
@@ -27,7 +27,7 @@ swiftc -O -swift-version 5 -parse-as-library \
     "$BREW/lib/libhackrf.a" "$BREW/lib/libusb-1.0.a" \
     -framework Accelerate -framework AVFoundation -framework CoreMedia -framework CoreVideo \
     -framework VideoToolbox -framework IOKit -framework CoreFoundation -framework Security \
-    -o "$APP/Contents/MacOS/ATSC Receiver"
+    -o "$APP/Contents/MacOS/SDR TV"
 
 cp Info.plist "$APP/Contents/Info.plist"
 swift make_icon.swift build/AppIcon.iconset
@@ -38,5 +38,17 @@ cp ../LICENSE ../THIRD_PARTY_NOTICES.md ../licenses/* "$APP/Contents/Resources/L
 
 codesign --force --sign - "$APP"
 VERSION=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" Info.plist)
-(cd build && ditto -c -k --keepParent "ATSC Receiver.app" "ATSC-Receiver-$VERSION-macOS-arm64.zip")
+(cd build && ditto -c -k --keepParent "SDR TV.app" "SDR-TV-$VERSION-macOS-arm64.zip")
 echo "Built $APP"
+
+# ./build.sh --install also copies the app into /Applications and registers it with Launch Services
+if [ "${1:-}" = "--install" ]; then
+    osascript -e 'quit app "SDR TV"' 2>/dev/null || true
+    sleep 1
+    rm -rf "/Applications/SDR TV.app"
+    ditto "$APP" "/Applications/SDR TV.app"
+    xattr -dr com.apple.quarantine "/Applications/SDR TV.app" 2>/dev/null || true
+    /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "/Applications/SDR TV.app"
+    touch "/Applications/SDR TV.app"
+    echo "Installed /Applications/SDR TV.app"
+fi

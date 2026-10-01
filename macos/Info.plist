@@ -3,13 +3,13 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleName</key>
-	<string>ATSC Receiver</string>
+	<string>SDR TV</string>
 	<key>CFBundleDisplayName</key>
-	<string>ATSC Receiver</string>
+	<string>SDR TV</string>
 	<key>CFBundleExecutable</key>
-	<string>ATSC Receiver</string>
+	<string>SDR TV</string>
 	<key>CFBundleIdentifier</key>
-	<string>local.atsc-receiver</string>
+	<string>local.sdr-tv</string>
 	<key>CFBundleIconFile</key>
 	<string>AppIcon</string>
 	<key>CFBundlePackageType</key>

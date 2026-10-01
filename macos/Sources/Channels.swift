@@ -55,11 +55,16 @@ struct GuideEvent: Codable, Hashable, Identifiable {
     var end: Date { start.addingTimeInterval(TimeInterval(duration)) }
 }
 
-/// Persistent channel list and broadcast guide (Application Support/ATSC Receiver).
+/// Persistent channel list and broadcast guide (Application Support/SDR TV).
 final class Library {
     static let folder: URL = {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        let u = base.appendingPathComponent("ATSC Receiver", isDirectory: true)
+        let u = base.appendingPathComponent("SDR TV", isDirectory: true)
+        // the app was called ATSC Receiver before: carry its channels and guide over
+        let old = base.appendingPathComponent("ATSC Receiver", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: u.path), FileManager.default.fileExists(atPath: old.path) {
+            try? FileManager.default.moveItem(at: old, to: u)
+        }
         try? FileManager.default.createDirectory(at: u, withIntermediateDirectories: true)
         return u
     }()

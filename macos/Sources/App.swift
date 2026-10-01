@@ -1,12 +1,12 @@
 import SwiftUI
 
 @main
-struct ATSCReceiverApp: App {
+struct SDRTVApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @StateObject private var tv = TV.shared
 
     var body: some Scene {
-        Window("ATSC Receiver", id: "tv") {
+        Window("SDR TV", id: "tv") {
             TVScreen()
                 .environmentObject(tv)
                 .frame(minWidth: 480, minHeight: 270)

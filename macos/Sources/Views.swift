@@ -571,7 +571,7 @@ struct RecordingSettings: View {
     @EnvironmentObject var tv: TV
     var body: some View {
         Form {
-            LabeledContent("Saved to", value: "Movies/ATSC Receiver")
+            LabeledContent("Saved to", value: "Movies/SDR TV")
             Button("Show Recordings in Finder") { tv.revealRecordings() }
             Text("Recordings are the broadcast stream saved exactly as received (MPEG transport stream, .ts): the channel's video, audio and guide data with no re-encoding. Play them with VLC or IINA.")
                 .font(.caption).foregroundStyle(.secondary)
@@ -592,7 +592,7 @@ struct SetupSheet: View {
             HStack(spacing: 14) {
                 Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 56, height: 56)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(tv.firstRun ? "Welcome to ATSC Receiver" : "Scan for Channels").font(.title2.weight(.semibold))
+                    Text(tv.firstRun ? "Welcome to SDR TV" : "Scan for Channels").font(.title2.weight(.semibold))
                     Text(subtitle).foregroundStyle(.secondary)
                 }
             }
