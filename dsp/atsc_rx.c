@@ -80,6 +80,10 @@ struct atsc_rx {
     _Atomic int quit;
     _Atomic uint32_t gen; uint32_t gen2, gen3;
     _Atomic int reset_req; double reset_hint;
+    _Atomic int relock_req;               // thread 2 asks for a full reacquisition (bad lock)
+    double tune_hint;                     // the pilot position the caller expects (from create/reset)
+    int bad_fields, relock_streak;        // thread 2: consecutive fields that train badly
+    uint64_t relocks;
     seg_desc q1[Q1_CAP]; int64_t q1_head, q1_tail;
     dispatch_semaphore_t q1_items, q1_space;
     soft_blk *q2; int64_t q2_head, q2_tail;
@@ -373,6 +377,7 @@ atsc_rx *atsc_rx_create(double fs, double pilot_hint_hz, atsc_ts_cb cb, void *ct
     rx->q2 = malloc(sizeof(soft_blk) * Q2_CAP);
     rx->q1_items = dispatch_semaphore_create(0); rx->q1_space = dispatch_semaphore_create(Q1_CAP);
     rx->q2_items = dispatch_semaphore_create(0); rx->q2_space = dispatch_semaphore_create(Q2_CAP);
+    rx->tune_hint = pilot_hint_hz;
     frontend_reset(rx, pilot_hint_hz);
     rx->gen2 = rx->gen3 = (uint32_t)-1;
     backend_reset(rx);
@@ -407,6 +412,8 @@ static void vit_reset(atsc_rx *rx) {
 void atsc_rx_reset(atsc_rx *rx, double pilot_hint_hz) {
     // applied by the processing thread at the start of the next atsc_rx_process call
     rx->reset_hint = pilot_hint_hz;
+    rx->tune_hint = pilot_hint_hz;
+    rx->relock_streak = 0;                    // a new channel gets the quick watchdog again
     atomic_store(&rx->reset_req, 1);
 }
 
@@ -442,6 +449,7 @@ void atsc_rx_get_stats(atsc_rx *rx, atsc_stats *o) {
     o->snr_db = rx->snr_db;
     o->dbfs = rx->dbfs;
     o->pilot_snr_db = rx->pilot_snr;
+    o->relocks = rx->relocks;
     o->fields = rx->fields;
     o->rs_good = rx->rs_good; o->rs_corrected = rx->rs_corr; o->rs_bad = rx->rs_bad;
     o->packets = rx->packets;
@@ -774,6 +782,19 @@ static void seg_dfe(atsc_rx *rx, const seg_desc *d) {
         // lock onto wrong decisions and never recover. If it measures badly on the known training
         // sequence, solve it again from scratch on this field's training data.
         if (rx->snr_db < 12) { dfe_init_ls(rx, s0); rx->dfe_resets++; }
+        // If it keeps training badly even when solved afresh every field, the trouble is upstream:
+        // carrier or symbol timing settled on a wrong solution (seen after retunes, while the
+        // tuner settles). Field sync is still found, so nothing else notices. A full reacquisition
+        // takes ~0.1 s and fixes it. A channel that is simply weak backs off: 8, 16, 32, 64 fields.
+        if (rx->snr_db < 12) {
+            int limit = 8 << (rx->relock_streak < 3 ? rx->relock_streak : 3);
+            if (++rx->bad_fields >= limit) {
+                rx->bad_fields = 0; rx->relock_streak++;
+                atomic_store(&rx->relock_req, 1);
+            }
+        } else if (rx->snr_db > 14) {
+            rx->bad_fields = 0; rx->relock_streak = 0;
+        }
         rx->seg_in_field = 1;
         return;
     }
@@ -797,7 +818,7 @@ static void *thread2(void *arg) {
         seg_desc d = rx->q1[rx->q1_tail % Q1_CAP];
         rx->q1_tail++;
         if (d.gen != rx->gen2) {                 // new acquisition: forget equalizer state
-            rx->gen2 = d.gen; rx->dfe_ready = 0; rx->seg_in_field = 0; rx->fields = 0; rx->snr_db = 0;
+            rx->gen2 = d.gen; rx->dfe_ready = 0; rx->seg_in_field = 0; rx->fields = 0; rx->snr_db = 0; rx->bad_fields = 0;
         }
         seg_dfe(rx, &d);
         dispatch_semaphore_signal(rx->q1_space);
@@ -968,6 +989,7 @@ static void acquire_pilot(atsc_rx *rx) {
 
 void atsc_rx_process(atsc_rx *rx, const int8_t *iq, size_t n) {
     if (atomic_exchange(&rx->reset_req, 0)) frontend_reset(rx, rx->reset_hint);
+    if (atomic_exchange(&rx->relock_req, 0)) { rx->relocks++; frontend_reset(rx, rx->tune_hint); }
     if (rx->timing_lost) {
         // keep the known pilot frequency as the hint so reacquisition is quick
         double hint = rx->state >= ATSC_ACQ_SEGMENT ? -rx->nco_f * rx->fs / (2 * M_PI) : rx->pilot_hint;

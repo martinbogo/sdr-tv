@@ -101,6 +101,11 @@ void atsc_media_select_captions(atsc_media *m, int service);
 /// PIDs needed to record the selected program (PAT, its PMT, video, audio, PSIP). Returns count.
 int atsc_media_selected_pids(atsc_media *m, int *pids, int max);
 
+/// Guide collection on this RF channel: distinct EIT sections received since the last reset, and
+/// transport packets since a new one last arrived. A mux repeats its whole guide every ~10-20 s,
+/// so once nothing new has come for a few seconds the guide it carries is complete.
+void atsc_media_guide_progress(atsc_media *m, int *sections, uint64_t *packets_since_new);
+
 /// The program number currently being decoded, or -1.
 int atsc_media_current_program(atsc_media *m);
 

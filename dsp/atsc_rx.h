@@ -33,6 +33,7 @@ typedef struct {
     uint64_t fields;            // field syncs seen since lock
     uint64_t rs_good, rs_corrected, rs_bad;   // Reed-Solomon codewords since reset
     uint64_t packets;
+    uint64_t relocks;           // full reacquisitions forced by a lock that trained badly
 } atsc_stats;
 
 /// fs: input sample rate (20e6). pilot_hint_hz: expected pilot offset from the tuned centre.

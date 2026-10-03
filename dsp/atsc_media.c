@@ -40,6 +40,9 @@ struct atsc_media {
     int pat_version, tvct_version;
     atsc_vchannel ch[MAX_CH]; int nch;
     int gps_utc_offset; int have_offset;
+    // guide completeness: distinct EIT sections seen (pid, source, section, version)
+    uint64_t eit_seen[4096]; int eit_count;
+    uint64_t pkts, eit_new_at;            // packet counter, and its value when the last new section came
 
     // selected program
     int want_program, cur_program;
@@ -227,7 +230,24 @@ static void parse_vct(atsc_media *m, const uint8_t *s, int len) {
     if (s[6] == s[7] && m->cb.channels) m->cb.channels(m->cb.ctx, m->ch, m->nch);   // last section
 }
 
-static void parse_eit(atsc_media *m, const uint8_t *s, int len) {
+/// Remember an EIT section; returns 1 if it had not been seen before.
+static int eit_note(atsc_media *m, int pid, const uint8_t *s) {
+    uint64_t key = (uint64_t)pid << 40 | (uint64_t)(s[3] << 8 | s[4]) << 24 | (uint64_t)s[6] << 8 | ((s[5] >> 1) & 0x1F);
+    key += 1;                                   // 0 marks an empty slot
+    uint32_t h = (uint32_t)((key * 0x9E3779B97F4A7C15ull) >> 52);
+    for (int probe = 0; probe < 4096; probe++, h = (h + 1) & 4095) {
+        if (m->eit_seen[h] == key) return 0;
+        if (!m->eit_seen[h]) {
+            if (m->eit_count > 3500) return 0;  // full: stop counting, never block
+            m->eit_seen[h] = key; m->eit_count++; m->eit_new_at = m->pkts;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void parse_eit(atsc_media *m, int pid, const uint8_t *s, int len) {
+    eit_note(m, pid, s);
     int source = s[3] << 8 | s[4];
     int n = s[9];
     int i = 10;
@@ -264,7 +284,7 @@ static void handle_section(atsc_media *m, int pid, const uint8_t *s, int len) {
     else if (kind == 3 && tid == 0xC7) parse_mgt(m, s, len);
     else if (kind == 3 && (tid == 0xC8 || tid == 0xC9)) parse_vct(m, s, len);
     else if (kind == 3 && tid == 0xCD) parse_stt(m, s, len);
-    else if (kind == 4 && tid == 0xCB) parse_eit(m, s, len);
+    else if (kind == 4 && tid == 0xCB) parse_eit(m, pid, s, len);
 }
 
 static void section_packet(atsc_media *m, int pid, const uint8_t *p, int n, int pusi) {
@@ -574,6 +594,12 @@ void atsc_media_reset(atsc_media *m) {
     m->video_type = m->audio_type = 0; m->v_frames = m->a_frames = 0;
     m->cur_pmt = -1; m->want_audio = 0;
     if (m->cc) cc_reset(m->cc);
+    memset(m->eit_seen, 0, sizeof m->eit_seen); m->eit_count = 0; m->pkts = m->eit_new_at = 0;
+}
+
+void atsc_media_guide_progress(atsc_media *m, int *sections, uint64_t *packets_since_new) {
+    *sections = m->eit_count;
+    *packets_since_new = m->pkts - m->eit_new_at;
 }
 
 void atsc_media_get_status(atsc_media *m, atsc_media_status *o) {
@@ -607,6 +633,7 @@ void atsc_media_select(atsc_media *m, int program) {
 }
 
 void atsc_media_push(atsc_media *m, const uint8_t *pk, int ok) {
+    m->pkts++;
     if (!ok || pk[0] != 0x47 || (pk[1] & 0x80)) { m->dropped++; return; }
     int pid = (pk[1] & 0x1F) << 8 | pk[2];
     int pusi = pk[1] & 0x40;

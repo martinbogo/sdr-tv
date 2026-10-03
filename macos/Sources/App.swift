@@ -46,6 +46,11 @@ struct TVCommands: Commands {
             Menu("Go to Channel") {
                 ForEach(tv.channels) { ch in Button("\(ch.number)  \(ch.name)\(ch.isUnavailable ? "  (weak)" : "")") { tv.tune(ch) } }
             }
+            Button(tv.guideRefreshing ? "Stop Updating Guide" : "Update Guide") {
+                tv.guideRefreshing ? tv.cancelGuideRefresh() : tv.refreshGuide()
+            }
+            .keyboardShortcut("u", modifiers: .command)
+            .disabled(tv.scanning)
             Divider()
             Button("Scan for Channels…") { tv.beginSetup() }.disabled(tv.scanning)
         }

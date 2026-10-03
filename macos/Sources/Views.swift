@@ -106,6 +106,8 @@ struct TVScreen: View {
                     .font(.callout).foregroundStyle(.secondary)
             }
             .foregroundStyle(.white.opacity(0.85))
+        } else if tv.guideRefreshing {
+            if !tv.guideVisible { GuideRefreshOSD() }
         } else if !tv.hasPicture, !tv.scanning, !tv.setupVisible, !tv.rechecking, tv.current != nil {
             TuningOSD()
         }
@@ -119,7 +121,9 @@ struct TVScreen: View {
         case .rightArrow: tv.changeVolume(0.05)
         case .leftArrow: tv.changeVolume(-0.05)
         case .return: tv.entry.isEmpty ? tv.toggleInfo() : tv.commitEntry()
-        case .escape: tv.bannerVisible = false; tv.entry = ""
+        case .escape:
+            if tv.guideRefreshing { tv.cancelGuideRefresh() }
+            tv.bannerVisible = false; tv.entry = ""
         default:
             guard let c = press.characters.first else { return .ignored }
             switch c.lowercased() {
@@ -133,6 +137,7 @@ struct TVScreen: View {
             case "r": tv.toggleRecording()
             case "f": NSApp.keyWindow?.toggleFullScreen(nil)
             case "s": tv.beginSetup()
+            case "u": tv.refreshGuide()
             default: return .ignored
             }
         }
@@ -375,7 +380,8 @@ struct GuideOSD: View {
                     Spacer()
                     Text(Date().formatted(date: .complete, time: .shortened)).foregroundStyle(.secondary)
                 }
-                .padding(.bottom, 12)
+                .padding(.bottom, 8)
+                GuideFreshness().padding(.bottom, 10)
                 HStack(spacing: 0) {
                     Color.clear.frame(width: chWidth, height: 24)
                     ForEach(0..<slots, id: \.self) { i in
@@ -397,7 +403,7 @@ struct GuideOSD: View {
                     }
                     .onChange(of: row) { _, r in withAnimation { proxy.scrollTo(r, anchor: .center) } }
                 }
-                Text("↑↓ choose  ·  ←→ time  ·  Return watch  ·  Esc or G close")
+                Text("↑↓ choose  ·  ←→ time  ·  Return watch  ·  U update guide  ·  Esc or G close")
                     .font(.caption).foregroundStyle(.secondary).padding(.top, 10)
             }
             .padding(24)
@@ -426,10 +432,61 @@ struct GuideOSD: View {
                 tv.guideVisible = false
             case .escape: tv.guideVisible = false
             default:
-                if press.characters.lowercased() == "g" { tv.guideVisible = false } else { return .ignored }
+                switch press.characters.lowercased() {
+                case "g": tv.guideVisible = false
+                case "u": tv.guideRefreshing ? tv.cancelGuideRefresh() : tv.refreshGuide()
+                default: return .ignored
+                }
             }
             return .handled
         }
+    }
+}
+
+/// Guide header line: how current the listings are, and the update control.
+struct GuideFreshness: View {
+    @EnvironmentObject var tv: TV
+
+    var body: some View {
+        let _ = tv.guideTick
+        HStack(spacing: 12) {
+            if tv.guideRefreshing {
+                ProgressView(value: tv.guideRefreshProgress).frame(width: 160).tint(.white)
+                Text(tv.guideRefreshNote).font(.callout).foregroundStyle(.secondary).lineLimit(1)
+                Spacer()
+                Button("Stop") { tv.cancelGuideRefresh() }
+            } else {
+                let stale = tv.staleGuideRFs.count
+                Image(systemName: stale > 0 ? "exclamationmark.circle" : "checkmark.circle")
+                    .foregroundStyle(stale > 0 ? .yellow : .green)
+                Text(stale > 0
+                     ? "Listings are missing or running out for \(stale) station\(stale == 1 ? "" : "s"). Each station only sends its own guide, so they are read one at a time (about 15 s each, the picture pauses)."
+                     : "Listings are current. The station you are watching keeps its guide up to date.")
+                    .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Spacer()
+                Button("Update Guide") { tv.refreshGuide() }
+            }
+        }
+        .controlSize(.regular)
+    }
+}
+
+/// Shown over the (paused) picture while the guide is being read from each station.
+struct GuideRefreshOSD: View {
+    @EnvironmentObject var tv: TV
+
+    var body: some View {
+        OSDPanel {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Updating the guide").font(.title3.weight(.semibold))
+                ProgressView(value: tv.guideRefreshProgress).tint(.white)
+                Text(tv.guideRefreshNote).font(.callout).foregroundStyle(.secondary).lineLimit(1)
+                Text("Esc stops and returns to \(tv.current.map { "\($0.number) \($0.name)" } ?? "the picture").")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            .frame(width: 440)
+        }
+        .foregroundStyle(.white)
     }
 }
 
@@ -439,6 +496,16 @@ struct GuideRow: View {
     let from: Date, to: Date
     let width, height, chWidth: CGFloat
     let selected, current: Bool
+
+    private var emptyText: String {
+        if ch.isUnavailable { return "No guide information (weak signal)" }
+        if tv.guideRefreshing { return "Waiting for this station's guide…" }
+        // read recently, and still nothing: the station is not sending listings for it
+        if let t = tv.library.guideUpdated[ch.rf], Date().timeIntervalSince(t) < 6 * 3600 {
+            return "The station is not sending listings for this channel"
+        }
+        return "No guide information yet. Press U to update"
+    }
 
     var body: some View {
         let span = to.timeIntervalSince(from)
@@ -454,7 +521,7 @@ struct GuideRow: View {
             ZStack(alignment: .leading) {
                 RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.04))
                 if events.isEmpty {
-                    Text("No guide information").foregroundStyle(.tertiary).padding(.leading, 10)
+                    Text(emptyText).foregroundStyle(.tertiary).padding(.leading, 10)
                 }
                 ForEach(events) { e in
                     let x0 = max(0, e.start.timeIntervalSince(from)) / span * Double(width)

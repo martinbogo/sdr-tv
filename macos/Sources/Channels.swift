@@ -108,12 +108,18 @@ final class Library {
         save()
     }
 
-    /// Merge the channels found on one RF channel (replacing what was known for it).
+    /// Merge the channels found on one RF channel (replacing what was known for it). The receiver
+    /// settings and weak mark belong to the RF channel, so they carry over to the new entries.
     func merge(rf: Int, found: [VirtualChannel]) {
         let hiddenIDs = Set(channels.filter { $0.hidden }.map(\.id))
+        let old = channels.first { $0.rf == rf }
         var list = channels.filter { $0.rf != rf }
         for var c in found {
             c.hidden = c.hidden || hiddenIDs.contains(c.id)
+            if let old {
+                c.lna = c.lna ?? old.lna; c.vga = c.vga ?? old.vga; c.amp = c.amp ?? old.amp
+                c.unavailable = c.unavailable ?? old.unavailable; c.bestSNR = c.bestSNR ?? old.bestSNR
+            }
             list.append(c)
         }
         setChannels(list)
@@ -150,6 +156,23 @@ final class Library {
 
     private var dirty = false
 
+    /// When each RF channel's guide was last read completely (RF channel -> time).
+    private(set) var guideUpdated: [Int: Date] = {
+        let d = UserDefaults.standard.dictionary(forKey: "guideUpdated") as? [String: Double] ?? [:]
+        return Dictionary(uniqueKeysWithValues: d.compactMap { k, v in Int(k).map { ($0, Date(timeIntervalSince1970: v)) } })
+    }()
+
+    func markGuideUpdated(rf: Int) {
+        guideUpdated[rf] = Date()
+        UserDefaults.standard.set(Dictionary(uniqueKeysWithValues: guideUpdated.map { (String($0.key), $0.value.timeIntervalSince1970) }),
+                                  forKey: "guideUpdated")
+    }
+
+    /// The last time the guide for this RF channel extends to, or nil if there is none.
+    func guideEnd(rf: Int) -> Date? {
+        channels.filter { $0.rf == rf }.compactMap { guide[$0.guideKey]?.last?.end }.max()
+    }
+
     func events(_ key: String, from: Date, to: Date) -> [GuideEvent] {
         (guide[key] ?? []).filter { $0.end > from && $0.start < to }
     }
@@ -163,7 +186,10 @@ final class Library {
 
     func prune() {
         let cutoff = Date().addingTimeInterval(-6 * 3600)
-        for (k, v) in guide { guide[k] = v.filter { $0.end > cutoff } }
+        for (k, v) in guide {
+            let keep = v.filter { $0.end > cutoff }
+            guide[k] = keep.isEmpty ? nil : keep
+        }
     }
 
     func save() {

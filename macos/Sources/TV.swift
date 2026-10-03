@@ -63,6 +63,9 @@ final class TV: ObservableObject {
     @Published private(set) var scanPhase = ""
     @Published private(set) var scanResults: [VirtualChannel] = []
     @Published private(set) var scanFinished = false
+    @Published private(set) var guideRefreshing = false
+    @Published private(set) var guideRefreshProgress = 0.0
+    @Published private(set) var guideRefreshNote = ""
     @Published var setupVisible = false             // modal scan window (first run, or a rescan)
     var firstRun: Bool { !defaults.bool(forKey: "initialScanDone") }
     @Published private(set) var recordingSince: Date?
@@ -126,9 +129,12 @@ final class TV: ObservableObject {
         channels = library.visibleChannels
 
         engine.onChannels = { [weak self] list in self?.channelsReceived(list) }
-        engine.onEvent = { [weak self] src, ev in
-            guard let self else { return }
-            library.add(event: ev, key: "\(engine.currentRF)-\(src)")
+        engine.onEvent = { [weak self] rf, src, ev in
+            if ProcessInfo.processInfo.environment["ATSC_GUIDEDEBUG"] != nil {
+                FileHandle.standardError.write("guide rf \(rf) source \(src) \(ev.start) \(ev.duration / 60) min \(ev.title)\n".data(using: .utf8)!)
+            }
+            guard let self, rf > 0 else { return }
+            library.add(event: ev, key: "\(rf)-\(src)")
             guideTick &+= 1
         }
         engine.onFormat = { [weak self] w, h, il, ach in
@@ -245,7 +251,8 @@ final class TV: ObservableObject {
         if scanning || rechecking { scanFound = list; return }
         guard !list.isEmpty else { return }
         let snr = stats.snr_db
-        library.merge(rf: engine.currentRF, found: list.map { var c = $0; c.signalDB = snr; return c })
+        guard let rf = list.first?.rf, rf > 0 else { return }
+        library.merge(rf: rf, found: list.map { var c = $0; c.signalDB = snr; return c })
         channels = library.visibleChannels
         // a station may renumber: keep the current selection pointing at the same program
         if let cur = current, let upd = channels.first(where: { $0.rf == cur.rf && $0.program == cur.program }) {
@@ -319,15 +326,111 @@ final class TV: ObservableObject {
             got = DispatchQueue.main.sync { self.scanFound }
             if !got.isEmpty { break }
         }
-        if !got.isEmpty { Thread.sleep(forTimeInterval: 1.5) }    // collect some guide data
+        if !got.isEmpty { collectGuide(rf: rf, maxWait: 25) }
         let list = got.filter { $0.rf == rf }.map { c -> VirtualChannel in
             var c = c; c.signalDB = snr; c.lna = g.lna; c.vga = g.vga; c.amp = g.amp; return c
         }
         return (list, pilot)
     }
 
+    /// Stay on the RF channel being decoded until its broadcast guide is complete: a mux repeats
+    /// every guide section within ~10-20 s, so it is done once nothing new has come for 4 s.
+    /// Runs off the main thread. Returns false if no guide arrived at all.
+    @discardableResult
+    private func collectGuide(rf: Int, maxWait: Double, cancelled: () -> Bool = { false }) -> Bool {
+        let deadline = Date().addingTimeInterval(maxWait)
+        while Date() < deadline, !cancelled() {
+            Thread.sleep(forTimeInterval: 0.25)
+            let p = engine.guideProgress()
+            if p.rf == rf, p.sections > 0, p.quiet >= 4 { break }
+        }
+        let p = engine.guideProgress()
+        guard p.rf == rf, p.sections > 0 else { return false }
+        DispatchQueue.main.async { self.library.markGuideUpdated(rf: rf); self.library.saveGuideIfNeeded(force: true) }
+        return true
+    }
+
+    /// Visit every station the user watches and read its guide (the user asked for it: this takes
+    /// the picture away for a minute or two). Weak stations are left alone. Ends back on the channel
+    /// that was playing.
+    func refreshGuide() {
+        guard !scanning, !guideRefreshing, deviceError == nil else { return }
+        let back = current
+        var rfs: [Int] = []
+        for c in channels where !c.isUnavailable && !rfs.contains(c.rf) { rfs.append(c.rf) }
+        // the channel being watched last, so the sweep ends where it started
+        if let r = back?.rf, let i = rfs.firstIndex(of: r) { rfs.remove(at: i); rfs.append(r) }
+        guard !rfs.isEmpty else { return }
+        guideRefreshing = true; guideRefreshProgress = 0; scanCancel = false
+        hasPicture = false; captionRegions = []
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            for (i, rf) in rfs.enumerated() {
+                guard let self, !self.scanCancel else { break }
+                let names: String = DispatchQueue.main.sync {
+                    self.guideRefreshProgress = Double(i) / Double(rfs.count)
+                    let chs = self.channels.filter { $0.rf == rf }
+                    if let c = chs.first {
+                        self.engine.tune(rf: rf)
+                        self.engine.select(program: -1)                 // tables only, no decoding
+                        if let l = c.lna { self.lna = l }
+                        if let v = c.vga { self.vga = v }
+                        if let a = c.amp, a != self.ampOn { self.ampOn = a }
+                    }
+                    let n = chs.prefix(3).map(\.name).joined(separator: ", ")
+                    self.guideRefreshNote = "Reading the guide from \(n)\(chs.count > 3 ? "…" : "")"
+                    return n
+                }
+                _ = names
+                let lockDeadline = Date().addingTimeInterval(5)
+                while Date() < lockDeadline, !self.scanCancel, self.engine.stats().state != ATSC_LOCKED {
+                    Thread.sleep(forTimeInterval: 0.1)
+                }
+                if self.engine.stats().state == ATSC_LOCKED {
+                    self.collectGuide(rf: rf, maxWait: 25, cancelled: { self.scanCancel })
+                }
+            }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let done = !self.scanCancel
+                self.guideRefreshing = false
+                self.guideTick &+= 1
+                self.library.saveGuideIfNeeded(force: true)
+                if let back { self.current = nil; self.tune(back, showBanner: false) }
+                self.flash(done ? "Guide updated" : "Guide update stopped")
+            }
+        }
+    }
+
+    func cancelGuideRefresh() { scanCancel = true }
+
+    private var guideNotedAt: Date?
+
+    /// While a channel plays, its station's whole guide streams in too; note when it is complete.
+    private func noteGuideWhileWatching() {
+        guard let cur = current, guideNotedAt != tunedAt else { return }
+        let t = tunedAt
+        let p = engine.guideProgress()
+        if p.rf == cur.rf, p.sections > 0, p.quiet >= 4 {
+            guideNotedAt = t
+            library.markGuideUpdated(rf: cur.rf)
+            library.saveGuideIfNeeded(force: true)
+        }
+    }
+
+    /// Stations whose guide is missing or runs out within six hours (and so are worth refreshing).
+    var staleGuideRFs: [Int] {
+        let soon = Date().addingTimeInterval(6 * 3600)
+        var rfs: [Int] = []
+        for c in channels where !c.isUnavailable && !rfs.contains(c.rf) {
+            // a station read in the last six hours is as current as it can be, even if it sent little
+            if let t = library.guideUpdated[c.rf], Date().timeIntervalSince(t) < 6 * 3600 { continue }
+            if (library.guideEnd(rf: c.rf) ?? .distantPast) < soon { rfs.append(c.rf) }
+        }
+        return rfs
+    }
+
     func scan() {
-        guard !scanning, deviceError == nil else { return }
+        guard !scanning, !guideRefreshing, deviceError == nil else { return }
         scanning = true; scanProgress = 0; scanCancel = false; scanFinished = false; scanResults = []
         guideVisible = false; bannerVisible = false
         hasPicture = false
@@ -620,6 +723,11 @@ final class TV: ObservableObject {
             let good = Double(l.good &- f.good), bad = Double(l.bad &- f.bad)
             lossRate = good + bad > 0 ? bad / (good + bad) : (s.state == ATSC_LOCKED ? 0 : 1)
         }
+        if rsHist.count >= 2 {
+            let a = rsHist[rsHist.count - 2], b = rsHist[rsHist.count - 1]
+            let good = Double(b.good &- a.good), bad = Double(b.bad &- a.bad)
+            recentLoss = good + bad > 0 ? bad / (good + bad) : 1
+        } else { recentLoss = 1 }
         weakSignal = hasPicture && (lossRate > 0.02 || (s.snr_db > 0 && s.snr_db < 15.5))
 
         if let dev = engine.device, !dev.isStreaming {
@@ -635,7 +743,8 @@ final class TV: ObservableObject {
             gainTestTicks += 1
             if gainTestTicks % 10 == 0 { vga = vga == 20 ? 22 : 20 }
         }
-        if scanning || rechecking { return }
+        if scanning || rechecking || guideRefreshing { return }
+        noteGuideWhileWatching()
         superviseReception(s, m)
         // Automatic gain. Every gain change is a small jolt to the demodulator, so it stays still
         // while reception is clean and only acts when the level is far off, or data is being lost.
@@ -659,12 +768,20 @@ final class TV: ObservableObject {
         if let p = dbgPrev { let dt = now.timeIntervalSince(p.0); vfps = Double(m.video_frames &- p.1) / dt; afps = Double(m.audio_frames &- p.2) / dt }
         dbgPrev = (now, m.video_frames, m.audio_frames)
         FileHandle.standardError.write(String(format: "t=%.1f fields=%llu clock=%+.2fppm pilot=%.0fdB ", now.timeIntervalSince(tunedAt), s.fields, s.clock_ppm, s.pilot_snr_db).data(using: .utf8)!)
-        FileHandle.standardError.write(String(format: "state=%d snr=%.1f dbfs=%.1f lna=%d vga=%d amp=%d loss=%.1f%% video=%.1ffps audio=%.1ffr/s overruns=%d rescue=%@ dropped=%llu\n",
+        FileHandle.standardError.write(String(format: "state=%d snr=%.1f dbfs=%.1f lna=%d vga=%d amp=%d loss=%.1f%% video=%.1ffps audio=%.1ffr/s overruns=%d rescue=%@ dropped=%llu relocks=%llu\n",
             s.state.rawValue, s.snr_db, s.dbfs, lna, vga, ampOn ? 1 : 0, lossRate * 100, vfps, afps, engine.overruns,
-            rescueNote ?? "-", m.dropped_packets).data(using: .utf8)!)
+            rescueNote ?? "-", m.dropped_packets, s.relocks).data(using: .utf8)!)
     }
 
     /// Is the current channel failing because of the signal (as opposed to, say, a codec)?
+    /// Packet loss over the last half second only (decisions after a tune cannot wait for ~2 s of history).
+    private var recentLoss = 1.0
+
+    /// The demodulator is delivering clean data (the picture follows within a GOP, ~1 s).
+    private func receptionGood(_ s: atsc_stats) -> Bool {
+        s.state == ATSC_LOCKED && s.snr_db >= 15 && recentLoss < 0.05
+    }
+
     private func signalProblem(_ s: atsc_stats) -> Bool {
         s.state != ATSC_LOCKED || s.snr_db < 15.5 || lossRate > 0.2
     }
@@ -680,7 +797,7 @@ final class TV: ObservableObject {
         if var r = rescue {
             if r.settling { return }
             r.bestSNR = max(r.bestSNR, s.state == ATSC_LOCKED ? s.snr_db : 0)
-            if hasPicture && lossRate < 0.05 {
+            if receptionGood(s) {
                 // this setting works: keep it for the RF channel
                 library.setGains(rf: r.rf, lna: lna, vga: vga, amp: ampOn)
                 library.restore(rf: r.rf)
@@ -689,8 +806,14 @@ final class TV: ObservableObject {
                 rescue = nil; rescueNote = nil
                 return
             }
-            if Date().timeIntervalSince(r.stepStarted) < 4.5 { rescue = r; return }
+            // lock takes ~0.1 s and a clean field or two shows in the error rate; the amplifier
+            // steps get a little longer for the front end to settle after switching
+            let dwell = Rescue.ladder[r.step].amp ? 2.0 : 1.5
+            if Date().timeIntervalSince(r.stepStarted) < dwell { rescue = r; return }
             r.step += 1
+            // more LNA/VGA gain only helps a signal that arrives low; with the level already near
+            // the target the noise is in the signal itself, and only the RF amplifier can help
+            while r.step < Rescue.ladder.count, !Rescue.ladder[r.step].amp, s.dbfs > -22 { r.step += 1 }
             if r.step >= Rescue.ladder.count {
                 giveUp(ch, bestSNR: r.bestSNR)
                 return
@@ -699,11 +822,19 @@ final class TV: ObservableObject {
             rescue = r
             return
         }
-        // start a rescue when the channel will not come up, or the picture has been lost
         let sinceTune = Date().timeIntervalSince(tunedAt)
-        let lostPicture = lastFrameAt.map { Date().timeIntervalSince($0) > 5 } ?? false
-        let noPictureYet = lastFrameAt == nil && sinceTune > 6
-        guard (noPictureYet || lostPicture), signalProblem(s) else { return }
+        // working reception on a station with no saved receiver settings: remember these
+        if ch.lna == nil, sinceTune > 3, hasPicture, lossRate < 0.01 {
+            library.setGains(rf: ch.rf, lna: lna, vga: vga, amp: ampOn)
+            channels = library.visibleChannels
+            current = channels.first { $0.id == ch.id } ?? ch
+        }
+        // Start a rescue as soon as the demodulator shows it is not getting there: 2 s after a tune
+        // without clean data (the receiver has reacquired by itself a few times by then), or once
+        // the picture has been gone for 3 s.
+        let notComingUp = lastFrameAt == nil && sinceTune > 2 && !receptionGood(s)
+        let lostPicture = lastFrameAt.map { Date().timeIntervalSince($0) > 3 } ?? false
+        guard notComingUp || (lostPicture && signalProblem(s)) else { return }
         // step 1 measures and sets the gain from scratch (a bad saved gain must not doom the rest)
         var r = Rescue(rf: ch.rf, base: (lna, vga))
         r.settling = true

@@ -36,6 +36,10 @@ final class Engine {
     // retune requests for the DSP thread
     private let tuneLock = NSLock()
     private var tuneGen = 0, tuneHint = 0.0
+    private var tuneRF = 0, tuneNewRF = false            // a retune (not a gain change) is pending
+    /// The RF channel whose packets the media thread is decoding (media thread only).
+    private var mediaRF = 0
+    private var cmdRF = 0
 
     // recording
     private let recLock = NSLock()
@@ -45,7 +49,7 @@ final class Engine {
 
     // app callbacks (main thread)
     var onChannels: (([VirtualChannel]) -> Void)?
-    var onEvent: ((Int, GuideEvent) -> Void)?           // source_id, event
+    var onEvent: ((Int, Int, GuideEvent) -> Void)?      // RF channel, source_id, event
     var onFormat: ((Int, Int, Bool, Int) -> Void)?      // width, height, interlaced, audio channels
     var onClock: ((Date) -> Void)?
     var currentRF = 0
@@ -74,7 +78,7 @@ final class Engine {
         cb.channels = { ctx, ch, n in
             guard let ctx, let ch else { return }
             let e = Unmanaged<Engine>.fromOpaque(ctx).takeUnretainedValue()
-            let rf = e.currentRF
+            let rf = e.mediaRF
             let list = (0..<Int(n)).map { i -> VirtualChannel in
                 var c = ch[i]
                 let name = withUnsafeBytes(of: &c.name) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
@@ -91,8 +95,8 @@ final class Engine {
             let g = GuideEvent(eventID: Int(ev.pointee.event_id),
                                start: Date(timeIntervalSince1970: TimeInterval(ev.pointee.start_utc)),
                                duration: Int(ev.pointee.duration), title: title)
-            let src = Int(ev.pointee.source_id)
-            DispatchQueue.main.async { e.onEvent?(src, g) }
+            let src = Int(ev.pointee.source_id), rf = e.mediaRF
+            DispatchQueue.main.async { e.onEvent?(rf, src, g) }
         }
         cb.time = { ctx, utc in
             guard let ctx else { return }
@@ -133,8 +137,9 @@ final class Engine {
     func tune(rf: Int) {
         currentRF = rf
         device?.setFrequency(RFBand.tuneHz(rf))
-        tuneLock.lock(); tuneGen += 1; tuneHint = RFBand.pilotHint(rf); tuneLock.unlock()
-        cmdLock.lock(); cmdReset = true; cmdLock.unlock()
+        // the DSP thread resets the media layer once the receiver has dropped the old channel's
+        // samples, so nothing decoded afterwards (guide events especially) belongs to the old one
+        tuneLock.lock(); tuneGen += 1; tuneHint = RFBand.pilotHint(rf); tuneRF = rf; tuneNewRF = true; tuneLock.unlock()
         player.flush()
     }
 
@@ -158,6 +163,14 @@ final class Engine {
         var s = atsc_media_status()
         if let media { atsc_media_get_status(media, &s) }
         return s
+    }
+
+    /// Guide collection on the RF channel being decoded: the channel, distinct guide sections so far,
+    /// and seconds since a new one arrived (a mux carries 19.39 Mb/s, about 12,900 packets a second).
+    func guideProgress() -> (rf: Int, sections: Int, quiet: Double) {
+        var n: Int32 = 0, since: UInt64 = 0
+        if let media { atsc_media_guide_progress(media, &n, &since) }
+        return (mediaRF, Int(n), Double(since) / 12_900)
     }
 
     func stats() -> atsc_stats {
@@ -188,7 +201,10 @@ final class Engine {
         var cursor = ring.written & ~1
         var seenGen = -1
         while true {
-            tuneLock.lock(); let gen = tuneGen, hint = tuneHint; tuneLock.unlock()
+            tuneLock.lock()
+            let gen = tuneGen, hint = tuneHint, rf = tuneRF, newRF = tuneNewRF
+            tuneNewRF = false
+            tuneLock.unlock()
             if gen != seenGen {
                 if ProcessInfo.processInfo.environment["ATSC_DEBUG"] != nil { FileHandle.standardError.write("DSP reset (retune/gain) gen \(gen)\n".data(using: .utf8)!) }
                 seenGen = gen
@@ -196,6 +212,7 @@ final class Engine {
                 Thread.sleep(forTimeInterval: 0.02)
                 cursor = ring.written & ~1
                 if let rx { atsc_rx_reset(rx, hint) }
+                if newRF { cmdLock.lock(); cmdReset = true; cmdRF = rf; cmdLock.unlock() }
             }
             var over = false
             let n = ring.read(cursor: &cursor, into: buf, max: chunk, overrun: &over)
@@ -223,11 +240,11 @@ final class Engine {
         while true {
             _ = pktSignal.wait(timeout: .now() + .milliseconds(20))
             cmdLock.lock()
-            let reset = cmdReset, prog = cmdProgram, aud = cmdAudio, ccs = cmdCaptions
+            let reset = cmdReset, rf = cmdRF, prog = cmdProgram, aud = cmdAudio, ccs = cmdCaptions
             cmdReset = false; cmdProgram = nil; cmdAudio = nil; cmdCaptions = nil
             cmdLock.unlock()
             if let media {
-                if reset { atsc_media_reset(media) }
+                if reset { atsc_media_reset(media); mediaRF = rf }
                 if let prog { atsc_media_select(media, Int32(prog)) }
                 if let aud { atsc_media_select_audio(media, Int32(aud)) }
                 if let ccs { atsc_media_select_captions(media, Int32(ccs)) }
