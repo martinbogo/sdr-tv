@@ -66,6 +66,9 @@ struct VirtualChannel: Codable, Hashable, Identifiable {
     var autoHidden: Bool?
     /// The user checked a poor channel back on: keep showing it whatever its reception.
     var userKept: Bool?
+    /// Recent reception results for the RF channel (oldest first, at most 4): scans, failed tunes,
+    /// clean viewing. The bucket comes from these, so one bad moment does not hide a station.
+    var tierHistory: [Int]?
 
     var isUnavailable: Bool { unavailable ?? false }
     /// Bars for the last measurement (none for a station marked weak).
@@ -78,6 +81,25 @@ struct VirtualChannel: Codable, Hashable, Identifiable {
         case 3: return "Poor"
         default: return "Not measured"
         }
+    }
+
+    /// Add a reception result and re-bucket from the recent ones.
+    mutating func record(_ t: Int) {
+        var h = (tierHistory ?? tier.map { [$0] } ?? []) + [t]   // lists from before histories: start from the bucket
+        if h.count > 4 { h.removeFirst(h.count - 4) }
+        tierHistory = h
+        assign(tier: Self.bucket(from: h))
+    }
+
+    /// Poor needs two poor results in the last three; Excellent needs the latest excellent and no
+    /// poor among the last three; anything between is Good. A first result stands on its own.
+    static func bucket(from h: [Int]) -> Int {
+        guard let last = h.last else { return 3 }
+        if h.count == 1 { return last }
+        let recent = h.suffix(3)
+        if recent.filter({ $0 == 3 }).count >= 2 { return 3 }
+        if last == 1 && !recent.contains(3) { return 1 }
+        return 2
     }
 
     /// Put the channel in a bucket. Poor ones are unchecked unless the user chose to keep them;
@@ -103,6 +125,12 @@ struct GuideEvent: Codable, Hashable, Identifiable {
     var start: Date
     var duration: Int
     var title: String
+    // from the broadcast's descriptors and Extended Text Tables (optional: older guides lack them)
+    var rating: String?
+    var captions: Bool?
+    var captionLangs: [String]?
+    var audioLangs: [String]?
+    var desc: String?
 
     var id: String { "\(eventID)-\(Int(start.timeIntervalSince1970))" }
     var end: Date { start.addingTimeInterval(TimeInterval(duration)) }
@@ -111,6 +139,11 @@ struct GuideEvent: Codable, Hashable, Identifiable {
 /// Persistent channel list and broadcast guide (Application Support/SDR TV).
 final class Library {
     static let folder: URL = {
+        if let dir = ProcessInfo.processInfo.environment["SDRTV_DATA_DIR"] {   // tests: a scratch folder
+            let u = URL(fileURLWithPath: dir, isDirectory: true)
+            try? FileManager.default.createDirectory(at: u, withIntermediateDirectories: true)
+            return u
+        }
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         let u = base.appendingPathComponent("SDR TV", isDirectory: true)
         // the app was called ATSC Receiver before: carry its channels and guide over
@@ -190,7 +223,7 @@ final class Library {
             if let old {
                 c.lna = c.lna ?? old.lna; c.vga = c.vga ?? old.vga; c.amp = c.amp ?? old.amp
                 c.unavailable = c.unavailable ?? old.unavailable; c.bestSNR = c.bestSNR ?? old.bestSNR
-                c.tier = c.tier ?? old.tier
+                c.tier = c.tier ?? old.tier; c.tierHistory = c.tierHistory ?? old.tierHistory
                 if c.signalDB == 0 { c.signalDB = old.signalDB }
             }
             list.append(c)
@@ -205,29 +238,36 @@ final class Library {
         let byID = Dictionary(channels.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
         let foundRFs = Set(found.map(\.rf))
         var list: [VirtualChannel] = []
+        let historyByRF = Dictionary(channels.map { ($0.rf, $0.tierHistory ?? []) }, uniquingKeysWith: { a, _ in a })
         for var c in found {
             let t = c.tier ?? 3
+            c.tierHistory = historyByRF[c.rf]
             if let prev = byID[c.id] {
-                // the user's own unchecking stands; the app's is undone by a good measurement (assign)
+                // the user's own unchecking stands; the app's is undone by a good result (assign)
                 c.hidden = prev.hidden
                 c.autoHidden = prev.autoHidden; c.userKept = prev.userKept
+                if c.tierHistory == nil { c.tierHistory = prev.tierHistory }
             }
             c.unavailable = nil
-            c.assign(tier: t)
+            c.record(t)
             list.append(c)
         }
         let foundIDs = Set(list.map(\.id))
         for var c in channels where !foundRFs.contains(c.rf) && !foundIDs.contains(c.id) {
-            c.assign(tier: 3)                       // not received this time: poor
+            c.record(3)                             // not received this time: a poor result
             list.append(c)
         }
         setChannels(list)
     }
 
-    /// Reception measured while watching: every channel on the RF channel moves to bucket `t`.
-    func setTier(rf: Int, _ t: Int) {
-        for i in channels.indices where channels[i].rf == rf { channels[i].assign(tier: t) }
+    /// A reception result while watching (1 clean at normal gain, 2 clean with a boost, 3 failed),
+    /// for every channel on the RF channel. Returns the resulting bucket.
+    @discardableResult
+    func record(rf: Int, _ t: Int) -> Int {
+        var result = t
+        for i in channels.indices where channels[i].rf == rf { channels[i].record(t); result = channels[i].tier ?? t }
         save()
+        return result
     }
 
     /// The user checks or unchecks a channel in Settings.
@@ -244,12 +284,18 @@ final class Library {
         }
     }
 
-    func add(event e: GuideEvent, key: String) {
+    /// Descriptions that arrived before their event (event ID by guide key).
+    private var pendingDesc: [String: [Int: String]] = [:]
+
+    func add(event incoming: GuideEvent, key: String) {
+        var e = incoming
         var list = guide[key] ?? []
         if let i = list.firstIndex(where: { $0.eventID == e.eventID && abs($0.start.timeIntervalSince(e.start)) < 60 }) {
+            if e.desc == nil { e.desc = list[i].desc }            // descriptions come separately
             if list[i] == e { return }
             list[i] = e
         } else {
+            if let d = pendingDesc[key]?.removeValue(forKey: e.eventID) { e.desc = d }
             // a new event replaces anything it overlaps (schedules change)
             list.removeAll { $0.start < e.end && e.start < $0.end }
             list.append(e)
@@ -260,6 +306,16 @@ final class Library {
     }
 
     private var dirty = false
+
+    /// A program description (Extended Text Table) for event `eventID` on guide key `key`.
+    func describe(key: String, eventID: Int, text: String) {
+        if var list = guide[key], let i = list.firstIndex(where: { $0.eventID == eventID && $0.end > Date() }) {
+            if list[i].desc == text { return }
+            list[i].desc = text; guide[key] = list; dirty = true
+        } else {
+            pendingDesc[key, default: [:]][eventID] = text
+        }
+    }
 
     /// When each RF channel's guide was last read completely (RF channel -> time).
     private(set) var guideUpdated: [Int: Date] = {

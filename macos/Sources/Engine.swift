@@ -50,6 +50,7 @@ final class Engine {
     // app callbacks (main thread)
     var onChannels: (([VirtualChannel]) -> Void)?
     var onEvent: ((Int, Int, GuideEvent) -> Void)?      // RF channel, source_id, event
+    var onDescription: ((Int, Int, Int, String) -> Void)?   // RF channel, source_id, event_id, text
     var onFormat: ((Int, Int, Bool, Int) -> Void)?      // width, height, interlaced, audio channels
     var onClock: ((Date) -> Void)?
     var currentRF = 0
@@ -92,11 +93,22 @@ final class Engine {
             let e = Unmanaged<Engine>.fromOpaque(ctx).takeUnretainedValue()
             var t = ev.pointee.title
             let title = withUnsafeBytes(of: &t) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+            let rating = fixedCString(ev.pointee.rating)
             let g = GuideEvent(eventID: Int(ev.pointee.event_id),
                                start: Date(timeIntervalSince1970: TimeInterval(ev.pointee.start_utc)),
-                               duration: Int(ev.pointee.duration), title: title)
+                               duration: Int(ev.pointee.duration), title: title,
+                               rating: rating.isEmpty ? nil : rating,
+                               captions: ev.pointee.captions != 0 ? true : nil,
+                               captionLangs: langList(fixedCString(ev.pointee.caption_langs)),
+                               audioLangs: langList(fixedCString(ev.pointee.audio_langs)))
             let src = Int(ev.pointee.source_id), rf = e.mediaRF
             DispatchQueue.main.async { e.onEvent?(rf, src, g) }
+        }
+        cb.description = { ctx, src, evid, text in
+            guard let ctx, let text else { return }
+            let e = Unmanaged<Engine>.fromOpaque(ctx).takeUnretainedValue()
+            let t = String(cString: text), rf = e.mediaRF
+            DispatchQueue.main.async { e.onDescription?(rf, Int(src), Int(evid), t) }
         }
         cb.time = { ctx, utc in
             guard let ctx else { return }
@@ -319,3 +331,12 @@ final class Engine {
         if recBuffer.count >= 1 << 20 { try? f.write(contentsOf: recBuffer); recBuffer.removeAll(keepingCapacity: true) }
     }
 }
+
+/// A C char array (imported as a tuple) as a String.
+private func fixedCString<T>(_ v: T) -> String {
+    var v = v
+    return withUnsafeBytes(of: &v) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+}
+
+/// "eng,spa" -> ["eng", "spa"]; nil when empty.
+private func langList(_ s: String) -> [String]? { s.isEmpty ? nil : s.split(separator: ",").map(String.init) }

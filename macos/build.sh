@@ -41,8 +41,10 @@ VERSION=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" Info.pli
 (cd build && ditto -c -k --keepParent "SDR TV.app" "SDR-TV-$VERSION-macOS-arm64.zip")
 echo "Built $APP"
 
-# ./build.sh --install also copies the app into /Applications and registers it with Launch Services
+# ./build.sh --install runs tests/run.sh, then copies the app into /Applications and registers it with Launch Services
 if [ "${1:-}" = "--install" ]; then
+    # regression checks first: a build that makes reception, decoding or the channel list worse is not installed
+    ../tests/run.sh || { echo "Not installed: regression checks failed (SKIP_TESTS=1 to override)"; [ "${SKIP_TESTS:-}" = 1 ] || exit 1; }
     osascript -e 'quit app "SDR TV"' 2>/dev/null || true
     sleep 1
     rm -rf "/Applications/SDR TV.app"

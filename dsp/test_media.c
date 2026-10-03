@@ -9,7 +9,10 @@
 static int frames, want_frame = 40, wrote;
 static long audio_frames;
 static const char *outpath;
-static int nevents;
+static int nevents, ndesc, nrated, ncc;
+static void on_desc(void *c, int src, int ev, const char *t) {
+    (void)c; if (ndesc++ < 2) printf("  description: source %d event %d: %.100s\n", src, ev, t);
+}
 
 static void on_video(void *c, const uint8_t *y, const uint8_t *u, const uint8_t *v, int ys, int uvs,
                      int w, int h, int sn, int sd, int64_t pts) {
@@ -42,6 +45,9 @@ static void on_channels(void *c, const atsc_vchannel *ch, int n) {
 }
 static void on_event(void *c, const atsc_event *e) {
     (void)c;
+    if (e->rating[0]) nrated++;
+    if (e->captions) ncc++;
+    if (nevents < 3) printf("  guide extras: rating '%s' captions %d (%s) audio '%s'\n", e->rating, e->captions, e->caption_langs, e->audio_langs);
     if (nevents++ < 12) {
         time_t t = e->start_utc; struct tm tm; localtime_r(&t, &tm);
         char buf[32]; strftime(buf, sizeof buf, "%a %H:%M", &tm);
@@ -58,18 +64,22 @@ static void on_format(void *c, int w, int h, int il, int ach) {
 
 int main(int argc, char **argv) {
     outpath = argv[3];
-    atsc_media_cb cb = {0}; cb.video = on_video; cb.audio = on_audio; cb.channels = on_channels; cb.event = on_event; cb.time = on_time; cb.format = on_format;
+    atsc_media_cb cb = {0}; cb.video = on_video; cb.audio = on_audio; cb.channels = on_channels; cb.event = on_event; cb.time = on_time; cb.format = on_format; cb.description = on_desc;
     atsc_media *m = atsc_media_create(&cb);
     atsc_media_select(m, atoi(argv[2]));
     FILE *f = fopen(argv[1], "rb");
     uint8_t pkt[188];
     struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
     long n = 0;
-    while (fread(pkt, 1, 188, f) == 188) { atsc_media_push(m, pkt, 1); n++; }
+    // DROP_EVERY=N DROP_LEN=K: lose K packets every N (a signal dropout), to exercise concealment
+    long every = getenv("DROP_EVERY") ? atol(getenv("DROP_EVERY")) : 0, dlen = getenv("DROP_LEN") ? atol(getenv("DROP_LEN")) : 200;
+    while (fread(pkt, 1, 188, f) == 188) { atsc_media_push(m, pkt, !(every && n % every < dlen)); n++; }
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double el = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
-    printf("%ld packets, %d video frames, %.2f s of audio, %d guide events, decoded in %.2f s\n",
-           n, frames, audio_frames / 48000.0, nevents, el);
+    printf("%ld packets, %d video frames, %.2f s of audio, %d guide events, %d descriptions, %d rated, %d captioned, decoded in %.2f s\n",
+           n, frames, audio_frames / 48000.0, nevents, ndesc, nrated, ncc, el);
+    atsc_media_status ms; atsc_media_get_status(m, &ms);
+    printf("dropouts: %llu stream gaps, %llu damaged frames held back\n", ms.stream_gaps, ms.held_frames);
     atsc_media_destroy(m);
     return 0;
 }

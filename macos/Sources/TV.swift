@@ -137,6 +137,11 @@ final class TV: ObservableObject {
             library.add(event: ev, key: "\(rf)-\(src)")
             guideTick &+= 1
         }
+        engine.onDescription = { [weak self] rf, src, evid, text in
+            guard let self, rf > 0 else { return }
+            library.describe(key: "\(rf)-\(src)", eventID: evid, text: text)
+            guideTick &+= 1
+        }
         engine.onFormat = { [weak self] w, h, il, ach in
             guard let self else { return }
             format = "\(h == 1088 ? 1080 : h)\(il ? "i" : "p")"
@@ -461,6 +466,7 @@ final class TV: ObservableObject {
     }
 
     private var qualitySum = 0.0, qualityN = 0, qualityFor: Date?
+    private var viewRecordedFor: Date?
 
     /// Average the quality while a channel plays (from 3 s after tuning, outside any rescue) and
     /// keep it for the channel list, so its bars reflect how the station really comes in.
@@ -469,6 +475,14 @@ final class TV: ObservableObject {
         if qualityFor != tunedAt { qualityFor = tunedAt; qualitySum = 0; qualityN = 0 }
         qualitySum += s.state == ATSC_LOCKED ? s.snr_db : 0; qualityN += 1
         if qualityN % 20 == 0 { library.setQuality(rf: cur.rf, snr: qualitySum / Double(qualityN)); channels = library.visibleChannels }
+        // 20 s of clean viewing counts as a reception result (once per tune)
+        if viewRecordedFor != tunedAt, Date().timeIntervalSince(tunedAt) > 20, hasPicture, lossRate < 0.01 {
+            viewRecordedFor = tunedAt
+            let avg = qualitySum / Double(max(qualityN, 1))
+            library.record(rf: cur.rf, avg >= 17 && !ampOn ? 1 : 2)
+            channels = library.visibleChannels
+            current = channels.first { $0.id == cur.id } ?? cur
+        }
     }
 
     /// Stations whose guide is missing or runs out within six hours (and so are worth refreshing).
@@ -780,7 +794,8 @@ final class TV: ObservableObject {
         media = m
         // picture present = new video frames are being decoded
         if m.video_frames != lastVideoFrames { lastVideoFrames = m.video_frames; lastFrameAt = Date() }
-        let picture = lastFrameAt.map { Date().timeIntervalSince($0) < 1.5 } ?? false
+        // after a dropout the last good frame is held until a clean keyframe (up to ~3 s): keep it up
+        let picture = lastFrameAt.map { Date().timeIntervalSince($0) < 3.5 } ?? false
         hasPicture = s.state == ATSC_LOCKED && picture && !format.isEmpty
         if s.state == ATSC_LOCKED { if lockedAt == nil { lockedAt = Date() } } else if !scanning { lockedAt = nil }
         // packet loss over the last ~2 s
@@ -870,7 +885,7 @@ final class TV: ObservableObject {
                 library.setGains(rf: r.rf, lna: lna, vga: vga, amp: ampOn)
                 library.restore(rf: r.rf)
                 // it took more than resetting the gain: extra gain or the amplifier, so bucket 2
-                if r.step >= 1, (ch.tier ?? 1) < 2 { library.setTier(rf: r.rf, 2) }
+                if r.step >= 1 { library.record(rf: r.rf, 2); viewRecordedFor = tunedAt }
                 channels = library.visibleChannels
                 flash("Reception recovered (\(Rescue.ladder[r.step].note.lowercased()))")
                 rescue = nil; rescueNote = nil
@@ -903,7 +918,7 @@ final class TV: ObservableObject {
         // without clean data (the receiver has reacquired by itself a few times by then), or once
         // the picture has been gone for 3 s.
         let notComingUp = lastFrameAt == nil && sinceTune > 2 && !receptionGood(s)
-        let lostPicture = lastFrameAt.map { Date().timeIntervalSince($0) > 3 } ?? false
+        let lostPicture = lastFrameAt.map { Date().timeIntervalSince($0) > 4 } ?? false
         guard notComingUp || (lostPicture && signalProblem(s)) else { return }
         // step 1 measures and sets the gain from scratch (a bad saved gain must not doom the rest)
         var r = Rescue(rf: ch.rf, base: (lna, vga))
@@ -937,15 +952,17 @@ final class TV: ObservableObject {
     private func giveUp(_ ch: VirtualChannel, bestSNR: Double) {
         rescue = nil; rescueNote = nil
         if ampOn { ampOn = false }
-        library.markUnavailable(rf: ch.rf, bestSNR: bestSNR)
-        library.setTier(rf: ch.rf, 3)                // poor: unchecked, unless the user keeps it
-        let kept = library.channels.first { $0.id == ch.id }?.userKept == true
+        let bucket = library.record(rf: ch.rf, 3)     // poor twice in three tries: unchecked
+        library.markUnavailable(rf: ch.rf, bestSNR: bestSNR)   // skipped by channel up/down until it works
+        let kept = library.channels.first { $0.id == ch.id }?.userKept == true || bucket != 3
         channels = library.visibleChannels
         let why = bestSNR > 0 ? String(format: "best signal quality %.1f dB, about 15 dB is needed", bestSNR)
                               : "no usable signal"
         if kept {
-            flash("\(ch.number) \(ch.name) is too weak to receive right now (\(why)). You chose to keep it listed; "
-                  + "choose it again to retry. Channel up/down will skip it.", seconds: 9)
+            let note = bucket != 3 ? "It usually comes in, so it stays listed; if this keeps happening it will be moved to Poor and hidden. "
+                                   : "You chose to keep it listed. "
+            flash("\(ch.number) \(ch.name) is too weak to receive right now (\(why)). " + note
+                  + "Choose it again to retry; channel up/down will skip it until then.", seconds: 10)
         } else {
             let n = library.channels.filter { $0.rf == ch.rf }.count
             flash("\(ch.number) \(ch.name) has poor reception (\(why)), so \(n == 1 ? "it was" : "all \(n) channels from this station were") "

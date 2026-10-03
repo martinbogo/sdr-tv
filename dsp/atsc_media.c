@@ -34,7 +34,7 @@ struct atsc_media {
 
     // PSI / PSIP
     section_buf *sec[MAX_PIDS];           // allocated on demand for table PIDs
-    uint8_t is_table[MAX_PIDS];           // 1 PAT, 2 PMT, 3 PSIP base, 4 EIT
+    uint8_t is_table[MAX_PIDS];           // 1 PAT, 2 PMT, 3 PSIP base, 4 EIT, 5 ETT
     int pmt_pid_of_program[65536 / 8];    // small map: program -> pmt pid (index by program & mask)
     int prog_list[MAX_CH], prog_pmt[MAX_CH], nprog;
     int pat_version, tvct_version;
@@ -65,6 +65,12 @@ struct atsc_media {
     int64_t a_next_pts, v_next_pts, v_frame_dur;
 
     uint64_t dropped;
+    // dropouts: continuity counters of the decoded streams, and what a gap does to the output
+    int v_cc, a_cc;                       // last continuity counter seen (-1: none yet)
+    int v_wait_key;                       // a gap hit the video: hold the picture until a clean keyframe
+    int64_t v_wait_from;                  // pts of the first frame held back
+    int a_skip;                           // audio frames still to drop after a gap
+    uint64_t v_held, gaps;                // frames held back, gaps seen (diagnostics)
 };
 
 // ----------------------------------------------------------------------------- utilities
@@ -198,6 +204,7 @@ static void parse_mgt(atsc_media *m, const uint8_t *s, int len) {
         int pid = (s[i + 2] & 0x1F) << 8 | s[i + 3];
         int dlen = (s[i + 9] & 0x0F) << 8 | s[i + 10];
         if (type >= 0x0100 && type <= 0x017F) set_table_pid(m, pid, 4);   // EIT-0 .. EIT-127
+        if (type >= 0x0200 && type <= 0x027F) set_table_pid(m, pid, 5);   // event ETT-0 .. ETT-127
         i += 11 + dlen;
     }
 }
@@ -230,9 +237,12 @@ static void parse_vct(atsc_media *m, const uint8_t *s, int len) {
     if (s[6] == s[7] && m->cb.channels) m->cb.channels(m->cb.ctx, m->ch, m->nch);   // last section
 }
 
-/// Remember an EIT section; returns 1 if it had not been seen before.
+/// Remember a guide section (EIT: pid, source, section, version; ETT: pid, ETM id, version);
+/// returns 1 if it had not been seen before.
 static int eit_note(atsc_media *m, int pid, const uint8_t *s) {
-    uint64_t key = (uint64_t)pid << 40 | (uint64_t)(s[3] << 8 | s[4]) << 24 | (uint64_t)s[6] << 8 | ((s[5] >> 1) & 0x1F);
+    uint64_t key = s[0] == 0xCC
+        ? ((uint64_t)1 << 63 | (uint64_t)pid << 40 | (uint64_t)((uint32_t)s[9] << 24 | s[10] << 16 | s[11] << 8 | s[12]) << 5 | ((s[5] >> 1) & 0x1F))
+        : ((uint64_t)pid << 40 | (uint64_t)(s[3] << 8 | s[4]) << 24 | (uint64_t)s[6] << 8 | ((s[5] >> 1) & 0x1F));
     key += 1;                                   // 0 marks an empty slot
     uint32_t h = (uint32_t)((key * 0x9E3779B97F4A7C15ull) >> 52);
     for (int probe = 0; probe < 4096; probe++, h = (h + 1) & 4095) {
@@ -244,6 +254,64 @@ static int eit_note(atsc_media *m, int pid, const uint8_t *s) {
         }
     }
     return 0;
+}
+
+/// Append a 3-letter language code to a comma-separated list if it is not there yet.
+static void add_lang(char *list, int cap, const uint8_t *code) {
+    char c[4] = {0};
+    for (int k = 0; k < 3; k++) c[k] = (code[k] >= 'a' && code[k] <= 'z') || (code[k] >= 'A' && code[k] <= 'Z') ? (char)(code[k] | 0x20) : 0;
+    if (!c[0] || !c[1] || !c[2] || strstr(list, c)) return;
+    if (strlen(list) + 4 + (list[0] != 0) >= (size_t)cap) return;
+    if (list[0]) strcat(list, ",");
+    strcat(list, c);
+}
+
+/// Ratings, captions and audio languages announced for one event.
+static void event_descriptors(atsc_event *ev, const uint8_t *d, const uint8_t *dend) {
+    for (const uint8_t *q = d; q + 2 <= dend && q + 2 + q[1] <= dend; q += 2 + q[1]) {
+        int tag = q[0], dl = q[1]; const uint8_t *v = q + 2, *vend = v + dl;
+        if (tag == 0x87 && dl >= 1 && !ev->rating[0]) {            // content advisory (A/65 6.9.9)
+            int regions = v[0] & 0x3F; const uint8_t *r = v + 1;
+            for (int k = 0; k < regions && r + 2 <= vend; k++) {
+                int dims = r[1]; r += 2 + 2 * dims;
+                if (r + 1 > vend) break;
+                int tl = r[0];
+                if (r + 1 + tl > vend) break;
+                if (tl && !ev->rating[0]) mss_to_utf8(r + 1, tl, ev->rating, sizeof ev->rating);
+                r += 1 + tl;
+            }
+        } else if (tag == 0x86 && dl >= 1) {                         // caption service
+            int ns = v[0] & 0x1F; const uint8_t *e = v + 1;
+            for (int k = 0; k < ns && e + 6 <= vend; k++, e += 6) {
+                ev->captions = 1;
+                add_lang(ev->caption_langs, sizeof ev->caption_langs, e);
+            }
+        } else if (tag == 0x81 && dl >= 5) {                         // AC-3 audio (A/52 Annex A)
+            int nch = (v[2] >> 1) & 0x0F, bsmod = v[2] >> 5;
+            const uint8_t *p = v + 4;                                // past langcod
+            if (nch == 0) p++;                                       // langcod2 (1+1 mode)
+            p++;                                                     // mainid/priority or asvcflags
+            (void)bsmod;
+            if (p >= vend) continue;
+            int textlen = p[0] >> 1; p += 1 + textlen;
+            if (p >= vend) continue;
+            int lf = p[0] >> 7, lf2 = (p[0] >> 6) & 1; p++;
+            if (lf && p + 3 <= vend) { add_lang(ev->audio_langs, sizeof ev->audio_langs, p); p += 3; }
+            if (lf2 && p + 3 <= vend) add_lang(ev->audio_langs, sizeof ev->audio_langs, p);
+        } else if (tag == 0x0A && dl >= 4) {                         // ISO 639 language (other audio codecs)
+            add_lang(ev->audio_langs, sizeof ev->audio_langs, v);
+        }
+    }
+}
+
+static void parse_ett(atsc_media *m, int pid, const uint8_t *s, int len) {
+    eit_note(m, pid, s);
+    if (len < 13 + 4 || !m->cb.description) return;
+    uint32_t etm = (uint32_t)s[9] << 24 | s[10] << 16 | s[11] << 8 | s[12];
+    if ((etm & 3) != 2) return;                  // event ETMs only (channel ETMs end in 00)
+    char text[2048];
+    mss_to_utf8(s + 13, len - 13 - 4, text, sizeof text);
+    if (text[0]) m->cb.description(m->cb.ctx, (int)(etm >> 16), (int)((etm >> 2) & 0x3FFF), text);
 }
 
 static void parse_eit(atsc_media *m, int pid, const uint8_t *s, int len) {
@@ -262,6 +330,9 @@ static void parse_eit(atsc_media *m, int pid, const uint8_t *s, int len) {
         mss_to_utf8(s + i + 10, tlen, ev.title, sizeof ev.title);
         ev.start_utc = GPS_EPOCH_UNIX + start - (m->have_offset ? m->gps_utc_offset : 18);
         int dlen = (s[i + 10 + tlen] & 0x0F) << 8 | s[i + 11 + tlen];
+        const uint8_t *d = s + i + 12 + tlen, *dend = d + dlen;
+        if (dend > s + len - 4) dend = s + len - 4;
+        event_descriptors(&ev, d, dend);
         if (m->cb.event) m->cb.event(m->cb.ctx, &ev);
         i += 12 + tlen + dlen;
     }
@@ -285,6 +356,7 @@ static void handle_section(atsc_media *m, int pid, const uint8_t *s, int len) {
     else if (kind == 3 && (tid == 0xC8 || tid == 0xC9)) parse_vct(m, s, len);
     else if (kind == 3 && tid == 0xCD) parse_stt(m, s, len);
     else if (kind == 4 && tid == 0xCB) parse_eit(m, pid, s, len);
+    else if (kind == 5 && tid == 0xCC) parse_ett(m, pid, s, len);
 }
 
 static void section_packet(atsc_media *m, int pid, const uint8_t *p, int n, int pusi) {
@@ -328,6 +400,7 @@ static void close_decoders(atsc_media *m) {
     m->vpes.started = m->apes.started = 0; m->vpes.len = m->apes.len = 0;
     m->fmt_w = m->fmt_h = m->fmt_ach = -1;
     m->a_next_pts = m->v_next_pts = AV_NOPTS_VALUE; m->v_frame_dur = 0;
+    m->v_cc = m->a_cc = -1; m->v_wait_key = 1; m->v_wait_from = AV_NOPTS_VALUE; m->a_skip = 0;
 }
 
 static enum AVCodecID video_codec(int t) {
@@ -472,6 +545,18 @@ static void decode_video(atsc_media *m, AVPacket *pk) {
             AVFrameSideData *sd = av_frame_get_side_data(f, AV_FRAME_DATA_A53_CC);
             if (sd && sd->size >= 3) { m->cc_pts = f->pts; cc_feed(m->cc, sd->data, (int)(sd->size / 3)); }
         }
+        // After a gap in the stream, frames decoded from incomplete data are smeared with blocks
+        // until the next keyframe. Hold the last good picture instead: show nothing until a clean
+        // keyframe arrives (or 3 s pass, for streams with very long keyframe intervals). Frames the
+        // decoder itself flags as damaged are never shown.
+        int damaged = (f->flags & AV_FRAME_FLAG_CORRUPT) || f->decode_error_flags;
+        if (m->v_wait_key) {
+            int key = (f->flags & AV_FRAME_FLAG_KEY) || f->pict_type == AV_PICTURE_TYPE_I;
+            if (m->v_wait_from == AV_NOPTS_VALUE) m->v_wait_from = f->pts;
+            int waited_long = f->pts != AV_NOPTS_VALUE && m->v_wait_from != AV_NOPTS_VALUE && f->pts - m->v_wait_from > 3 * 90000;
+            if ((key && !damaged) || (waited_long && !damaged)) { m->v_wait_key = 0; m->v_wait_from = AV_NOPTS_VALUE; }
+            else { m->v_held++; av_frame_unref(f); continue; }
+        } else if (damaged) { m->v_held++; av_frame_unref(f); continue; }
         AVRational sar = f->sample_aspect_ratio.num ? f->sample_aspect_ratio : (AVRational){1, 1};
         if (!m->graph || f->width != m->g_w || f->height != m->g_h || f->format != m->g_fmt ||
             sar.num != m->g_sn || sar.den != m->g_sd) {
@@ -517,6 +602,7 @@ static void decode_audio(atsc_media *m, AVPacket *pk) {
             pts = m->a_next_pts;                       // also smooths sub-10 ms timestamp jitter
         if (pts != AV_NOPTS_VALUE) m->a_next_pts = pts + (int64_t)got * 90000 / f->sample_rate;
         if (got > 0) m->a_frames++;
+        if (m->a_skip > 0) { m->a_skip--; av_frame_unref(f); continue; }   // around a gap: brief silence, not a glitch
         if (got > 0 && pts != AV_NOPTS_VALUE && m->cb.audio) m->cb.audio(m->cb.ctx, m->abuf, got, f->sample_rate, pts);
         av_frame_unref(f);
     }
@@ -614,6 +700,7 @@ void atsc_media_get_status(atsc_media *m, atsc_media_status *o) {
     o->audio_supported = m->adec != NULL;
     o->video_frames = m->v_frames; o->audio_frames = m->a_frames;
     o->dropped_packets = m->dropped;
+    o->held_frames = m->v_held; o->stream_gaps = m->gaps;
 }
 
 int atsc_media_selected_pids(atsc_media *m, int *pids, int max) {
@@ -642,6 +729,16 @@ void atsc_media_push(atsc_media *m, const uint8_t *pk, int ok) {
     if (afc == 2 || afc == 0) return;               // no payload
     if (afc == 3) { i += 1 + pk[4]; if (i >= 188) return; }
     const uint8_t *p = pk + i; int n = 188 - i;
+    if (pid == m->video_pid || pid == m->audio_pid) {
+        // continuity counter: +1 per packet with payload; a repeat is a permitted duplicate
+        int cc = pk[3] & 0x0F, *last = pid == m->video_pid ? &m->v_cc : &m->a_cc;
+        if (*last >= 0 && cc == *last) return;                        // duplicate packet
+        if (*last >= 0 && cc != ((*last + 1) & 0x0F)) {               // packets went missing
+            m->gaps++;
+            if (pid == m->video_pid) m->v_wait_key = 1; else m->a_skip = 2;
+        }
+        *last = cc;
+    }
     if (m->sec[pid]) section_packet(m, pid, p, n, pusi);
     else if (pid == m->video_pid) pes_packet(m, 1, p, n, pusi);
     else if (pid == m->audio_pid) pes_packet(m, 0, p, n, pusi);

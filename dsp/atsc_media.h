@@ -27,6 +27,10 @@ typedef struct {
     int64_t start_utc;           // Unix time, seconds
     int duration;                // seconds
     char title[256];             // UTF-8
+    char rating[32];             // content advisory text, e.g. "TV-PG-L" ("" if not given)
+    int captions;                // 1 if a caption service is announced for the program
+    char caption_langs[16];      // ISO 639-2 codes, comma-separated ("eng,spa")
+    char audio_langs[24];        // languages of the program's audio, comma-separated
 } atsc_event;
 
 typedef struct {
@@ -41,6 +45,8 @@ typedef struct {
     void (*channels)(void *ctx, const atsc_vchannel *ch, int n);
     /// A guide event was received (may repeat; key is source_id + event_id).
     void (*event)(void *ctx, const atsc_event *ev);
+    /// Extended text (the program description) for a guide event, from an Extended Text Table.
+    void (*description)(void *ctx, int source_id, int event_id, const char *text);
     /// Broadcast clock from the System Time Table, Unix seconds.
     void (*time)(void *ctx, int64_t utc);
     /// Caption screen changed (JSON, see atsc_captions.h), to be shown at video time `pts`.
@@ -67,6 +73,8 @@ typedef struct {
     int video_supported, audio_supported;
     uint64_t video_frames, audio_frames;   // decoded since the program was selected
     uint64_t dropped_packets;    // packets lost to uncorrectable errors
+    uint64_t held_frames;        // damaged video frames not shown (the last good picture stays up)
+    uint64_t stream_gaps;        // gaps found in the video/audio streams (continuity counter)
 } atsc_media_status;
 
 void atsc_media_get_status(atsc_media *m, atsc_media_status *out);

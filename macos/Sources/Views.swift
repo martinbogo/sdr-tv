@@ -187,7 +187,13 @@ struct ChannelBanner: View {
                 Divider().frame(height: 64)
                 VStack(alignment: .leading, spacing: 6) {
                     if let now {
-                        Text(now.title).font(.title2.weight(.semibold)).lineLimit(1)
+                        HStack(spacing: 10) {
+                            Text(now.title).font(.title2.weight(.semibold)).lineLimit(1)
+                            ProgramBadges(e: now)
+                        }
+                        if let d = now.desc {
+                            Text(d).font(.callout).foregroundStyle(.secondary).lineLimit(2).frame(maxWidth: 520, alignment: .leading)
+                        }
                         HStack(spacing: 10) {
                             Text("\(now.start.formatted(date: .omitted, time: .shortened)) – \(now.end.formatted(date: .omitted, time: .shortened))")
                                 .foregroundStyle(.secondary)
@@ -403,6 +409,10 @@ struct GuideOSD: View {
                     }
                     .onChange(of: row) { _, r in withAnimation { proxy.scrollTo(r, anchor: .center) } }
                 }
+                if tv.channels.indices.contains(row) {
+                    let focus = startOffset == 0 ? Date() : start.addingTimeInterval(1)
+                    GuideDetails(ch: tv.channels[row], at: focus).padding(.top, 12)
+                }
                 Text("↑↓ choose  ·  ←→ time  ·  Return watch  ·  U update guide  ·  Esc or G close")
                     .font(.caption).foregroundStyle(.secondary).padding(.top, 10)
             }
@@ -440,6 +450,59 @@ struct GuideOSD: View {
             }
             return .handled
         }
+    }
+}
+
+/// Language name for an ISO 639-2 code ("spa" -> "Spanish").
+func languageName(_ code: String) -> String {
+    Locale.current.localizedString(forLanguageCode: code) ?? code.uppercased()
+}
+
+/// Rating and caption markers for a program.
+struct ProgramBadges: View {
+    let e: GuideEvent
+    var body: some View {
+        HStack(spacing: 6) {
+            if let r = e.rating { Badge(r) }
+            if e.captions == true {
+                Badge("CC").help("Closed captions" + ((e.captionLangs?.isEmpty ?? true) ? "" : ": " + e.captionLangs!.map(languageName).joined(separator: ", ")))
+            }
+            if let a = e.audioLangs, a.count > 1 { Badge(a.map { $0.uppercased() }.joined(separator: " · ")).help("Audio in " + a.map(languageName).joined(separator: ", ")) }
+        }
+    }
+}
+
+/// The selected program in the guide: time, rating, captions, audio languages and description.
+struct GuideDetails: View {
+    @EnvironmentObject var tv: TV
+    let ch: VirtualChannel
+    let at: Date
+
+    var body: some View {
+        let e = tv.library.events(ch.guideKey, from: at, to: at.addingTimeInterval(1)).first
+        VStack(alignment: .leading, spacing: 5) {
+            if let e {
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    Text(e.title).font(.headline).lineLimit(1)
+                    Text("\(e.start.formatted(date: .omitted, time: .shortened)) – \(e.end.formatted(date: .omitted, time: .shortened)) · \(e.duration / 60) min")
+                        .font(.callout).foregroundStyle(.secondary)
+                    ProgramBadges(e: e)
+                    Spacer()
+                }
+                let caps = e.captions == true ? "Captions" + ((e.captionLangs?.isEmpty ?? true) ? "" : " in " + e.captionLangs!.map(languageName).joined(separator: ", ")) : "No captions announced"
+                let audio = (e.audioLangs?.isEmpty ?? true) ? "" : "  ·  Audio in " + e.audioLangs!.map(languageName).joined(separator: ", ")
+                Text(caps + audio).font(.callout).foregroundStyle(.secondary)
+                Text(e.desc ?? "No description from the station.")
+                    .font(.callout).foregroundStyle(e.desc == nil ? .tertiary : .primary)
+                    .lineLimit(3).fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text("\(ch.number) \(ch.name)").font(.headline)
+                Text("No program information for this time.").font(.callout).foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 84, alignment: .topLeading)
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.06)))
     }
 }
 
@@ -529,8 +592,13 @@ struct GuideRow: View {
                     let x0 = max(0, e.start.timeIntervalSince(from)) / span * Double(width)
                     let x1 = min(span, e.end.timeIntervalSince(from)) / span * Double(width)
                     let live = e.start <= Date() && Date() < e.end
-                    Text(e.title)
-                        .font(.callout).lineLimit(1)
+                    HStack(spacing: 6) {
+                        Text(e.title).font(.callout).lineLimit(1)
+                        if x1 - x0 > 150 {
+                            Spacer(minLength: 0)
+                            if e.captions == true { Text("CC").font(.caption2.weight(.bold)).foregroundStyle(.secondary).accessibilityLabel("Closed captions") }
+                        }
+                    }
                         .padding(.horizontal, 8)
                         .frame(width: max(0, CGFloat(x1 - x0) - 3), height: height - 6, alignment: .leading)
                         .background(RoundedRectangle(cornerRadius: 6).fill(live ? Color.white.opacity(0.16) : Color.white.opacity(0.08)))
