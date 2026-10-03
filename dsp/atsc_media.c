@@ -528,8 +528,10 @@ static int build_graph(atsc_media *m, AVFrame *f) {
     AVFilterInOut *outs = avfilter_inout_alloc(), *ins = avfilter_inout_alloc();
     outs->name = av_strdup("in"); outs->filter_ctx = m->src; outs->pad_idx = 0; outs->next = NULL;
     ins->name = av_strdup("out"); ins->filter_ctx = m->sink; ins->pad_idx = 0; ins->next = NULL;
-    // bwdif: motion-adaptive deinterlacing, one output frame per input frame; progressive frames pass through
-    int r = avfilter_graph_parse_ptr(m->graph, "bwdif=mode=send_frame:parity=auto:deint=interlaced,format=yuv420p", &ins, &outs, NULL);
+    // bwdif: motion-adaptive deinterlacing to one picture per field (59.94 a second, as a TV shows
+    // interlaced video): live video moves smoothly, and film carried with 3:2 pulldown keeps its
+    // even cadence (one picture per frame would repeat every fifth and judder). Progressive frames pass through.
+    int r = avfilter_graph_parse_ptr(m->graph, "bwdif=mode=send_field:parity=auto:deint=interlaced,format=yuv420p", &ins, &outs, NULL);
     avfilter_inout_free(&ins); avfilter_inout_free(&outs);
     if (r < 0 || avfilter_graph_config(m->graph, NULL) < 0) return -1;
     m->g_w = f->width; m->g_h = f->height; m->g_fmt = f->format; m->g_sn = sar.num; m->g_sd = sar.den;

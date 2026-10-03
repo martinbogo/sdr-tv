@@ -241,7 +241,19 @@ final class Player {
             note("first picture on screen")
         }
         if let sb { layer.sampleBufferRenderer.enqueue(sb) }
+        if debug, started {
+            let now = sync.currentTime()
+            if now.isValid {
+                let lead = Double(pts - Int64(now.seconds * 90_000)) / 90
+                leadMin = min(leadMin, lead); if lead < 0 { lateFrames += 1 }; leadFrames += 1
+                if Date().timeIntervalSince(leadReport) > 2 {
+                    FileHandle.standardError.write(String(format: "player: video lead min %.0f ms, %d of %d frames late, buffer %lld ms\n", leadMin, lateFrames, leadFrames, latency / 90).data(using: .utf8)!)
+                    leadMin = 1e9; lateFrames = 0; leadFrames = 0; leadReport = Date()
+                }
+            }
+        }
     }
+    private var leadMin = 1e9, lateFrames = 0, leadFrames = 0, leadReport = Date()
 
     // MARK: audio
 

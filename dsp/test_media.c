@@ -1,3 +1,4 @@
+#include <string.h>
 // Offline harness: decode a transport stream file; list channels and guide events, count
 // frames and audio, and write one frame of the chosen program as a PPM.
 //   test_media <file.ts> <program> <out.ppm>
@@ -19,7 +20,17 @@ static void on_video(void *c, const uint8_t *y, const uint8_t *u, const uint8_t 
                      int w, int h, int sn, int sd, int64_t pts) {
     (void)c;
     if (first_frame_pkt < 0) first_frame_pkt = pkt_now;
+    if (getenv("FRAMEDIFF")) {                  // motion between consecutive pictures (repeats show as ~0)
+        static uint8_t *prev; static int pw, ph; static int k;
+        if (prev && pw == w && ph == h && k < 120) {
+            double d = 0; for (int r = 0; r < h; r += 2) for (int x = 0; x < w; x += 2) d += abs(y[r * ys + x] - prev[r * w + x]);
+            printf("diff %.2f\n", d / ((h / 2) * (w / 2))); k++;
+        }
+        if (!prev || pw != w || ph != h) { free(prev); prev = malloc(w * h); pw = w; ph = h; }
+        for (int r = 0; r < h; r++) memcpy(prev + r * w, y + r * ys, w);
+    }
     if (switch_pkt >= 0 && switch_frame_pkt < 0) switch_frame_pkt = pkt_now;
+    if (getenv("SHOWPTS") && switch_pkt >= 0) { static int k; if (k++ < 90) printf("emit pts %.3f at packet %ld\n", pts / 90000.0, pkt_now); }
     if (frames == 0) printf("first video frame %dx%d sar %d/%d pts %.3f s\n", w, h, sn, sd, pts / 90000.0);
     if (frames < 8) printf("  video pts %.4f\n", pts / 90000.0);
     if (++frames == want_frame && !wrote) {

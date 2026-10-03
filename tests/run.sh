@@ -56,6 +56,8 @@ acq rf25.iq "KOIN" 8 0.15 19
 echo "media layer"
 media ch26_20s.ts "KGW transport stream" 3 6 500 1800 1500 900
 media rf25.ts "KOIN transport stream" 3 6 60 280 0 0
+# 480i film with 3:2 pulldown (49.2): one picture per field, ~59.94 a second (one per frame judders)
+media ch26_20s.ts "49.2, interlaced film" 6 6 1000 1800 1500 900
 
 # dropouts: lose 300 packets every ~3 s; damaged frames must be held back and decoding must recover
 if [ -f captures/ch26_20s.ts ]; then
