@@ -418,6 +418,7 @@ struct GuideOSD: View {
             }
             .padding(24)
             .frame(width: g.size.width * 0.86, height: g.size.height * 0.8)
+            .background(Color.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 20, style: .continuous))   // busy pictures stay out of the text
             .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
             .environment(\.colorScheme, .dark)
             .foregroundStyle(.white)

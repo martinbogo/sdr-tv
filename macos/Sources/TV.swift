@@ -129,18 +129,17 @@ final class TV: ObservableObject {
         channels = library.visibleChannels
 
         engine.onChannels = { [weak self] list in self?.channelsReceived(list) }
-        engine.onEvent = { [weak self] rf, src, ev in
-            if ProcessInfo.processInfo.environment["ATSC_GUIDEDEBUG"] != nil {
-                FileHandle.standardError.write("guide rf \(rf) source \(src) \(ev.start) \(ev.duration / 60) min \(ev.title)\n".data(using: .utf8)!)
+        engine.onGuide = { [weak self] batch in
+            guard let self else { return }
+            let debug = ProcessInfo.processInfo.environment["ATSC_GUIDEDEBUG"] != nil
+            for (rf, src, ev) in batch.events where rf > 0 {
+                if debug { FileHandle.standardError.write("guide rf \(rf) source \(src) \(ev.start) \(ev.duration / 60) min \(ev.title)\n".data(using: .utf8)!) }
+                library.add(event: ev, key: "\(rf)-\(src)")
             }
-            guard let self, rf > 0 else { return }
-            library.add(event: ev, key: "\(rf)-\(src)")
-            guideTick &+= 1
-        }
-        engine.onDescription = { [weak self] rf, src, evid, text in
-            guard let self, rf > 0 else { return }
-            library.describe(key: "\(rf)-\(src)", eventID: evid, text: text)
-            guideTick &+= 1
+            for (rf, src, evid, text) in batch.descriptions where rf > 0 {
+                library.describe(key: "\(rf)-\(src)", eventID: evid, text: text)
+            }
+            guideTick &+= 1                          // one view refresh per batch
         }
         engine.onFormat = { [weak self] w, h, il, ach in
             guard let self else { return }
@@ -199,11 +198,12 @@ final class TV: ObservableObject {
         if ch.isUnavailable { flash("\(ch.number) \(ch.name) was too weak last time. Trying again…", seconds: 4) }
         if let cur = current, cur.id != ch.id { previous = cur }
         if engine.currentRF != ch.rf || current == nil {
-            engine.tune(rf: ch.rf); lockedAt = nil
-            // per-channel gain from the scan (automatic gain, if on, refines it from here)
-            if let l = ch.lna { lna = l }
-            if let v = ch.vga { vga = v }
+            // the station's own receiver settings go in before the retune, so the receiver acquires
+            // once at the right gain instead of being jolted by a gain change just after
+            if let l = ch.lna, l != lna { lna = l }
+            if let v = ch.vga, v != vga { vga = v }
             if let a = ch.amp, a != ampOn { ampOn = a }
+            engine.tune(rf: ch.rf); lockedAt = nil
         }
         engine.select(program: ch.program)
         current = ch

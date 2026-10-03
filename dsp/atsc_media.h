@@ -75,6 +75,7 @@ typedef struct {
     uint64_t dropped_packets;    // packets lost to uncorrectable errors
     uint64_t held_frames;        // damaged video frames not shown (the last good picture stays up)
     uint64_t stream_gaps;        // gaps found in the video/audio streams (continuity counter)
+    uint64_t instant_switches;   // program switches that started from the cached GOP
 } atsc_media_status;
 
 void atsc_media_get_status(atsc_media *m, atsc_media_status *out);

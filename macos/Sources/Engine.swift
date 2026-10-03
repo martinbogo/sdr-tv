@@ -49,8 +49,24 @@ final class Engine {
 
     // app callbacks (main thread)
     var onChannels: (([VirtualChannel]) -> Void)?
-    var onEvent: ((Int, Int, GuideEvent) -> Void)?      // RF channel, source_id, event
-    var onDescription: ((Int, Int, Int, String) -> Void)?   // RF channel, source_id, event_id, text
+    /// Guide data arrives in floods (a station's whole guide within seconds of tuning): it is
+    /// collected on the media thread and handed to the main thread in batches, at most 4 a second.
+    struct GuideBatch {
+        var events: [(rf: Int, source: Int, event: GuideEvent)] = []
+        var descriptions: [(rf: Int, source: Int, eventID: Int, text: String)] = []
+        var isEmpty: Bool { events.isEmpty && descriptions.isEmpty }
+    }
+    var onGuide: ((GuideBatch) -> Void)?
+    private var guideBatch = GuideBatch()             // media thread only
+    private var guideFlushedAt = Date()
+
+    /// Media thread: pass collected guide data on if a quarter second has passed.
+    private func flushGuide(force: Bool = false) {
+        guard !guideBatch.isEmpty, force || Date().timeIntervalSince(guideFlushedAt) > 0.25 else { return }
+        let b = guideBatch
+        guideBatch = GuideBatch(); guideFlushedAt = Date()
+        DispatchQueue.main.async { [weak self] in self?.onGuide?(b) }
+    }
     var onFormat: ((Int, Int, Bool, Int) -> Void)?      // width, height, interlaced, audio channels
     var onClock: ((Date) -> Void)?
     var currentRF = 0
@@ -102,13 +118,13 @@ final class Engine {
                                captionLangs: langList(fixedCString(ev.pointee.caption_langs)),
                                audioLangs: langList(fixedCString(ev.pointee.audio_langs)))
             let src = Int(ev.pointee.source_id), rf = e.mediaRF
-            DispatchQueue.main.async { e.onEvent?(rf, src, g) }
+            e.guideBatch.events.append((rf, src, g))
         }
         cb.description = { ctx, src, evid, text in
             guard let ctx, let text else { return }
             let e = Unmanaged<Engine>.fromOpaque(ctx).takeUnretainedValue()
             let t = String(cString: text), rf = e.mediaRF
-            DispatchQueue.main.async { e.onDescription?(rf, Int(src), Int(evid), t) }
+            e.guideBatch.descriptions.append((rf, Int(src), Int(evid), t))
         }
         cb.time = { ctx, utc in
             guard let ctx else { return }
@@ -272,6 +288,7 @@ final class Engine {
                 for i in 0..<localOK.count { atsc_media_push(media, b.baseAddress! + 188 * i, Int32(localOK[i])) }
             }
             local.removeAll(keepingCapacity: true); localOK.removeAll(keepingCapacity: true)
+            flushGuide()
         }
     }
 

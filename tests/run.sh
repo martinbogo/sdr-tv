@@ -67,6 +67,17 @@ if [ -f captures/ch26_20s.ts ]; then
     else bad "KGW with dropouts: ${gaps:-0} gaps (min 5), ${held:-0} held (min 1), ${v:-0} shown (min 200)"; fi
 else skip "KGW with dropouts" ch26_20s.ts; fi
 
+# channel change speed: picture after a subchannel switch (from the keyframe cache) and from a cold start
+if [ -f captures/ch26_20s.ts ]; then
+    worst=0; for to in 4 5 6 7; do for at in 100000 160000 220000; do
+        ms=$(SWITCH_AT=$at SWITCH_TO=$to "$OUT/test_media" captures/ch26_20s.ts 3 "$OUT/frame.ppm" 2>/dev/null | sed -nE 's/.*picture after (-?[0-9]+) ms.*/\1/p')
+        [ "${ms:--1}" -lt 0 ] && ms=99999; [ "$ms" -gt "$worst" ] && worst=$ms
+    done; done
+    if [ "$worst" -le 50 ]; then pass "subchannel switch: picture within $worst ms (12 switches)"; else bad "subchannel switch: worst $worst ms (max 50)"; fi
+    cold=$("$OUT/test_media" captures/ch26_20s.ts 3 "$OUT/frame.ppm" 2>/dev/null | sed -nE 's/^timing: first picture ([0-9]+) ms.*/\1/p')
+    if [ "${cold:-99999}" -le 2500 ]; then pass "cold start: first picture after ${cold} ms of stream"; else bad "cold start: ${cold:-none} ms (max 2500)"; fi
+else skip "channel change speed" ch26_20s.ts; fi
+
 echo "channel list rules"
 swiftc -O -parse-as-library -o "$OUT/library_tests" macos/Sources/Channels.swift tests/LibraryTests.swift 2>&1 | grep -E "error" && fail=1
 if [ -x "$OUT/library_tests" ]; then

@@ -33,8 +33,16 @@ final class Player {
     private var candidateAspect: CGFloat = 0
     private var candidateCount = 0
     private var fmtDesc: CMVideoFormatDescription?
-    /// How far behind the live broadcast playback runs, to absorb decode and delivery jitter.
-    let latency: Int64 = 72_000                 // 0.8 s in 90 kHz ticks
+    /// How far behind the live broadcast playback runs, to absorb decode and delivery jitter. Starts
+    /// small so a channel change plays quickly; grows (up to 1 s) if audio ever arrives too late.
+    private(set) var latency: Int64 = 36_000     // 0.4 s in 90 kHz ticks
+    private var stillShown = false
+    private var firstFrameOnScreen = false
+    private var flushedAt = Date()
+    private let debug = ProcessInfo.processInfo.environment["ATSC_DEBUG"] != nil
+    private func note(_ what: String) {
+        if debug { FileHandle.standardError.write(String(format: "player: %@ %.0f ms after the channel change\n", what, Date().timeIntervalSince(flushedAt) * 1000).data(using: .utf8)!) }
+    }
 
     init() {
         layer.videoGravity = .resize             // the view sizes the layer to the right shape
@@ -60,6 +68,9 @@ final class Player {
         layer.sampleBufferRenderer.flush(removingDisplayedImage: true, completionHandler: nil)
         audio.flush()
         started = false
+        stillShown = false
+        firstFrameOnScreen = false
+        flushedAt = Date()
         lastRaw = [nil, nil]
         wrapBase = [0, 0]
         candidateCount = 0
@@ -91,11 +102,17 @@ final class Player {
         if started { return }
         // Start the clock on the first audio (or on video if no audio shows up within a second).
         if !isAudio {
+            if !stillShown {
+                // show the first picture right away as a still: the clock (paused) is put at its time
+                stillShown = true
+                sync.setRate(0, time: CMTime(value: pts, timescale: 90_000))
+            }
             if pendingSince == nil { pendingSince = Date() }
             if Date().timeIntervalSince(pendingSince!) < 1.0 { return }
         }
         sync.setRate(1, time: CMTime(value: pts - latency, timescale: 90_000))
         started = true
+        note(isAudio ? "playing (sound)" : "playing (no sound)")
     }
 
     /// Keeps the audio device clock and the broadcast clock from drifting apart over hours.
@@ -209,6 +226,20 @@ final class Player {
         var sb: CMSampleBuffer?
         CMSampleBufferCreateReadyWithImageBuffer(allocator: nil, imageBuffer: pb, formatDescription: fmt,
                                                  sampleTiming: &timing, sampleBufferOut: &sb)
+        if !firstFrameOnScreen, let fmt = fmtDesc {
+            // the first picture after a channel change goes up now, not when the clock reaches it:
+            // a copy timed at the clock's current position, then the frame itself at its own time
+            firstFrameOnScreen = true
+            let now = sync.currentTime()
+            if started, now.isValid, pts > Int64(now.seconds * 90_000) + 4_500 {
+                var t = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: now, decodeTimeStamp: .invalid)
+                var early: CMSampleBuffer?
+                CMSampleBufferCreateReadyWithImageBuffer(allocator: nil, imageBuffer: pb, formatDescription: fmt,
+                                                         sampleTiming: &t, sampleBufferOut: &early)
+                if let early { layer.sampleBufferRenderer.enqueue(early) }
+            }
+            note("first picture on screen")
+        }
         if let sb { layer.sampleBufferRenderer.enqueue(sb) }
     }
 
@@ -221,6 +252,15 @@ final class Player {
         latestPTS = max(latestPTS, pts)
         startIfNeeded(pts, isAudio: true)
         checkDrift()
+        // audio arriving with less than 40 ms to spare will underrun: run further behind live
+        if started, latency < 90_000 {
+            let now = sync.currentTime()
+            if now.isValid, pts - Int64(now.seconds * 90_000) < 3_600 {
+                latency = min(90_000, latency + 18_000)
+                if debug { FileHandle.standardError.write("player: audio nearly late, buffer now \(latency * 1000 / 90_000) ms\n".data(using: .utf8)!) }
+                sync.setRate(1, time: CMTime(value: pts - latency, timescale: 90_000))   // audio's own time: video runs ahead
+            }
+        }
         if audioFormat == nil || Int(CMAudioFormatDescriptionGetStreamBasicDescription(audioFormat!)!.pointee.mSampleRate) != rate {
             var asbd = AudioStreamBasicDescription(
                 mSampleRate: Float64(rate), mFormatID: kAudioFormatLinearPCM,

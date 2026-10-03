@@ -14,9 +14,12 @@ static void on_desc(void *c, int src, int ev, const char *t) {
     (void)c; if (ndesc++ < 2) printf("  description: source %d event %d: %.100s\n", src, ev, t);
 }
 
+static long pkt_now, first_frame_pkt = -1, switch_pkt = -1, switch_frame_pkt = -1;
 static void on_video(void *c, const uint8_t *y, const uint8_t *u, const uint8_t *v, int ys, int uvs,
                      int w, int h, int sn, int sd, int64_t pts) {
     (void)c;
+    if (first_frame_pkt < 0) first_frame_pkt = pkt_now;
+    if (switch_pkt >= 0 && switch_frame_pkt < 0) switch_frame_pkt = pkt_now;
     if (frames == 0) printf("first video frame %dx%d sar %d/%d pts %.3f s\n", w, h, sn, sd, pts / 90000.0);
     if (frames < 8) printf("  video pts %.4f\n", pts / 90000.0);
     if (++frames == want_frame && !wrote) {
@@ -73,13 +76,23 @@ int main(int argc, char **argv) {
     long n = 0;
     // DROP_EVERY=N DROP_LEN=K: lose K packets every N (a signal dropout), to exercise concealment
     long every = getenv("DROP_EVERY") ? atol(getenv("DROP_EVERY")) : 0, dlen = getenv("DROP_LEN") ? atol(getenv("DROP_LEN")) : 200;
-    while (fread(pkt, 1, 188, f) == 188) { atsc_media_push(m, pkt, !(every && n % every < dlen)); n++; }
+    // SWITCH_AT=packet SWITCH_TO=program: change program mid-stream (a subchannel switch)
+    long sw_at = getenv("SWITCH_AT") ? atol(getenv("SWITCH_AT")) : -1; int sw_to = getenv("SWITCH_TO") ? atoi(getenv("SWITCH_TO")) : 0;
+    while (fread(pkt, 1, 188, f) == 188) {
+        if (n == sw_at) { switch_pkt = n; pkt_now = n; atsc_media_select(m, sw_to); }
+        pkt_now = n;
+        atsc_media_push(m, pkt, !(every && n % every < dlen)); n++;
+    }
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double el = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
     printf("%ld packets, %d video frames, %.2f s of audio, %d guide events, %d descriptions, %d rated, %d captioned, decoded in %.2f s\n",
            n, frames, audio_frames / 48000.0, nevents, ndesc, nrated, ncc, el);
     atsc_media_status ms; atsc_media_get_status(m, &ms);
     printf("dropouts: %llu stream gaps, %llu damaged frames held back\n", ms.stream_gaps, ms.held_frames);
+    double pps = 19392658.0 / 188 / 8;                      // packets per second of a mux
+    if (first_frame_pkt >= 0) printf("timing: first picture %.0f ms into the stream\n", first_frame_pkt / pps * 1000);
+    if (switch_pkt >= 0) printf("timing: switch to program %d: picture after %.0f ms (%s)\n", sw_to,
+        switch_frame_pkt >= 0 ? (switch_frame_pkt - switch_pkt) / pps * 1000 : -1.0, ms.instant_switches ? "from cache" : "waited for a keyframe");
     atsc_media_destroy(m);
     return 0;
 }

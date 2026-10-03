@@ -10,6 +10,7 @@
 #include <libavutil/opt.h>
 #include <libswresample/swresample.h>
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -71,9 +72,20 @@ struct atsc_media {
     int64_t v_wait_from;                  // pts of the first frame held back
     int a_skip;                           // audio frames still to drop after a gap
     uint64_t v_held, gaps;                // frames held back, gaps seen (diagnostics)
+    // instant subchannel switching: every program's video since its last keyframe, as TS packets
+    struct gop_cache {
+        int pid; uint8_t *buf; int n, cap, open;
+        uint8_t *prev; int prev_n, prev_cap;          // the GOP before, complete
+        uint64_t started;                             // mux packet count when the current GOP began
+    } gop[MAX_CH]; int ngop;
+    int replaying; int64_t replay_emit_from;   // while replaying: emit the first frame, then only recent ones
+    int replay_shown; uint64_t replays;
 };
 
 // ----------------------------------------------------------------------------- utilities
+
+/// ATSC_VDEBUG=1: log decoded video frames and cache replays (read once).
+static int vdebug(void) { static int v = -1; if (v < 0) v = getenv("ATSC_VDEBUG") != NULL; return v; }
 
 static uint32_t crc32_mpeg(const uint8_t *d, int n) {
     uint32_t c = 0xFFFFFFFF;
@@ -125,6 +137,9 @@ static void set_table_pid(atsc_media *m, int pid, int kind) {
 }
 
 static void select_streams(atsc_media *m);
+static void gop_cache_track(atsc_media *m);
+static void gop_cache_replay(atsc_media *m);
+static void gop_cache_clear(atsc_media *m);
 
 static void parse_pat(atsc_media *m, const uint8_t *s, int len) {
     int ver = (s[5] >> 1) & 0x1F;
@@ -193,6 +208,7 @@ static void parse_pmt(atsc_media *m, const uint8_t *s, int len) {
     for (; k < npmt; k++) if (pmts[k].prog == prog) break;
     if (k == npmt && npmt < MAX_CH) npmt++;
     if (k < MAX_CH) pmts[k] = pi;
+    gop_cache_track(m);
     select_streams(m);
 }
 
@@ -463,6 +479,7 @@ static void select_streams(atsc_media *m) {
         } else {
             open_decoders(m);
             if (m->cc) cc_reset(m->cc);
+            if (!m->replaying) gop_cache_replay(m);
         }
         return;
     }
@@ -549,7 +566,16 @@ static void decode_video(atsc_media *m, AVPacket *pk) {
         // until the next keyframe. Hold the last good picture instead: show nothing until a clean
         // keyframe arrives (or 3 s pass, for streams with very long keyframe intervals). Frames the
         // decoder itself flags as damaged are never shown.
+        if (m->replaying) {
+            // catching up through the cached GOP: show its keyframe at once, skip the frames whose
+            // time has long passed, and pass on only the last moment before live
+            int first = !m->replay_shown;
+            if (!first && (f->pts == AV_NOPTS_VALUE || f->pts < m->replay_emit_from)) { av_frame_unref(f); continue; }
+            m->replay_shown = 1;
+        }
         int damaged = (f->flags & AV_FRAME_FLAG_CORRUPT) || f->decode_error_flags;
+        if (vdebug()) fprintf(stderr, "vframe pts %.3f type %c key %d corrupt %d err %d wait %d\n", f->pts / 90000.0,
+            av_get_picture_type_char(f->pict_type), !!(f->flags & AV_FRAME_FLAG_KEY), !!(f->flags & AV_FRAME_FLAG_CORRUPT), f->decode_error_flags, m->v_wait_key);
         if (m->v_wait_key) {
             int key = (f->flags & AV_FRAME_FLAG_KEY) || f->pict_type == AV_PICTURE_TYPE_I;
             if (m->v_wait_from == AV_NOPTS_VALUE) m->v_wait_from = f->pts;
@@ -666,6 +692,7 @@ void atsc_media_destroy(atsc_media *m) {
     for (int i = 0; i < MAX_PIDS; i++) free(m->sec[i]);
     av_frame_free(&m->frame); av_frame_free(&m->filt); av_packet_free(&m->pkt);
     free(m->abuf);
+    gop_cache_clear(m);
     free(m);
 }
 
@@ -676,6 +703,7 @@ void atsc_media_reset(atsc_media *m) {
     set_table_pid(m, 0x1FFB, 3);
     m->pat_version = m->tvct_version = -1;
     m->nprog = 0; m->nch = 0; npmt = 0;
+    gop_cache_clear(m);
     m->cur_program = -1; m->video_pid = m->audio_pid = -1;
     m->video_type = m->audio_type = 0; m->v_frames = m->a_frames = 0;
     m->cur_pmt = -1; m->want_audio = 0;
@@ -700,7 +728,7 @@ void atsc_media_get_status(atsc_media *m, atsc_media_status *o) {
     o->audio_supported = m->adec != NULL;
     o->video_frames = m->v_frames; o->audio_frames = m->a_frames;
     o->dropped_packets = m->dropped;
-    o->held_frames = m->v_held; o->stream_gaps = m->gaps;
+    o->held_frames = m->v_held; o->stream_gaps = m->gaps; o->instant_switches = m->replays;
 }
 
 int atsc_media_selected_pids(atsc_media *m, int *pids, int max) {
@@ -719,9 +747,131 @@ void atsc_media_select(atsc_media *m, int program) {
     select_streams(m);
 }
 
+static void av_packet_route(atsc_media *m, const uint8_t *pk);
+
+/// Exp-Golomb ue(v) from an RBSP bit position (enough for slice headers; no emulation bytes this early).
+static unsigned ue_read(const uint8_t *b, int len, int *bit) {
+    int zeros = 0;
+    while (*bit < len * 8 && !((b[*bit >> 3] >> (7 - (*bit & 7))) & 1)) { zeros++; (*bit)++; }
+    (*bit)++;
+    unsigned v = 0;
+    for (int k = 0; k < zeros && *bit < len * 8; k++, (*bit)++) v = v << 1 | ((b[*bit >> 3] >> (7 - (*bit & 7))) & 1);
+    return (1u << zeros) - 1 + v;
+}
+
+/// Does this packet start a PES that begins with a keyframe? Decided from the first coded picture
+/// in the packet when it is there (MPEG-2 picture_coding_type, H.264 IDR or I slice, HEVC IRAP);
+/// otherwise from random_access_indicator or an MPEG-2 GOP header. (Some streams repeat sequence
+/// headers and parameter sets on every frame, so those alone do not count.)
+static int starts_keyframe(const uint8_t *pk) {
+    if (!(pk[1] & 0x40)) return 0;
+    int afc = (pk[3] >> 4) & 3, i = 4, rai = 0;
+    if (afc & 2) { rai = pk[4] > 0 && (pk[5] & 0x40); i += 1 + pk[4]; }
+    if (!(afc & 1) || i + 9 > 188) return rai;
+    const uint8_t *p = pk + i;
+    if (p[0] != 0 || p[1] != 0 || p[2] != 1) return 0;
+    int gop = 0;
+    for (int k = i + 9 + p[8]; k + 6 < 188; k++) {
+        if (pk[k] || pk[k + 1] || pk[k + 2] != 1) continue;
+        int c = pk[k + 3];
+        if (c == 0x00) return ((pk[k + 5] >> 3) & 7) == 1;     // MPEG-2 picture header: I?
+        if (c == 0xB8) gop = 1;
+        if (!(c & 0x80)) {
+            int t = c & 0x1F;
+            if (t == 5) return 1;                               // H.264 IDR slice
+            if (t == 1) {                                       // non-IDR slice: I if slice_type is 2 or 7
+                int bit = 0; const uint8_t *r = pk + k + 4; int len = 188 - (k + 4);
+                ue_read(r, len, &bit);                          // first_mb_in_slice
+                return ue_read(r, len, &bit) % 5 == 2;
+            }
+            int h = (c >> 1) & 0x3F;
+            if (!(c & 0x81) && h <= 31 && pk[k + 4] == 0x01) {  // HEVC NAL header (layer 0, tid 1)
+                if (h >= 16 && h <= 21) return 1;               // IRAP
+                if (h <= 9) return 0;                           // other picture slices
+            }
+        }
+    }
+    return rai || gop;
+}
+
+/// Keep the packets of every program's video since its last keyframe (a few MB each), so a
+/// switch to another program on this RF channel can show a picture without waiting for one.
+static void gop_cache_packet(atsc_media *m, int pid, const uint8_t *pk) {
+    struct gop_cache *g = NULL;
+    for (int k = 0; k < m->ngop; k++) if (m->gop[k].pid == pid) { g = &m->gop[k]; break; }
+    if (!g) return;
+    if (starts_keyframe(pk)) {
+        // keep the finished GOP: a switch while the new keyframe is still arriving replays from it
+        if (g->open && g->n) {
+            uint8_t *t = g->prev; int tc = g->prev_cap;
+            g->prev = g->buf; g->prev_cap = g->cap; g->prev_n = g->n;
+            g->buf = t; g->cap = tc;
+        } else g->prev_n = 0;
+        g->n = 0; g->open = 1; g->started = m->pkts;
+    }
+    if (!g->open) return;
+    if (g->n >= 40000) { g->open = 0; g->n = 0; g->prev_n = 0; return; }   // ~7.5 MB without a keyframe: give up until the next
+    if ((g->n + 1) * 188 > g->cap) { g->cap = g->cap ? g->cap * 2 : 188 * 4096; g->buf = realloc(g->buf, g->cap); }
+    memcpy(g->buf + 188 * g->n++, pk, 188);
+}
+
+static void gop_cache_track(atsc_media *m) {
+    for (int k = 0; k < npmt && m->ngop < MAX_CH; k++) {
+        int pid = pmts[k].video, have = 0;
+        if (pid <= 0) continue;
+        for (int j = 0; j < m->ngop; j++) if (m->gop[j].pid == pid) have = 1;
+        if (!have) { memset(&m->gop[m->ngop], 0, sizeof m->gop[0]); m->gop[m->ngop++].pid = pid; }
+    }
+}
+
+static void gop_cache_clear(atsc_media *m) {
+    for (int k = 0; k < m->ngop; k++) { free(m->gop[k].buf); free(m->gop[k].prev); }
+    m->ngop = 0;
+}
+
+/// Feed the newly selected video its cached GOP, so its picture appears now.
+static void gop_cache_replay(atsc_media *m) {
+    struct gop_cache *g = NULL;
+    for (int k = 0; k < m->ngop; k++) if (m->gop[k].pid == m->video_pid) g = &m->gop[k];
+    if (vdebug()) fprintf(stderr, "replay pid %#x: %s, %d packets, type %#x\n", m->video_pid, g ? (g->open ? "open" : "closed") : "untracked", g ? g->n : 0, m->video_type);
+    if (!g || !g->open || !g->n) return;
+    // the newest keyframe needs time to arrive in full (it is the largest picture): if it began
+    // less than 0.4 s ago, start from the GOP before it, which runs on into this one
+    int use_prev = g->prev_n > 0 && m->pkts - g->started < 5200;
+    int total = (use_prev ? g->prev_n : 0) + g->n;
+    #define CACHED(k) ((k) < (use_prev ? g->prev_n : 0) ? g->prev + 188 * (k) : g->buf + 188 * ((k) - (use_prev ? g->prev_n : 0)))
+    int64_t last = AV_NOPTS_VALUE;
+    for (int k = 0; k < total; k++) {                          // newest PTS in the cache
+        const uint8_t *pk = CACHED(k);
+        if (!(pk[1] & 0x40)) continue;
+        int afc = (pk[3] >> 4) & 3, i = 4;
+        if (afc & 2) i += 1 + pk[4];
+        if (!(afc & 1) || i + 14 > 188) continue;
+        const uint8_t *p = pk + i;
+        if (p[0] || p[1] || p[2] != 1 || !(p[7] & 0x80)) continue;
+        last = ((int64_t)(p[9] & 0x0E) << 29) | ((int64_t)p[10] << 22) | ((int64_t)(p[11] & 0xFE) << 14) | ((int64_t)p[12] << 7) | (p[13] >> 1);
+    }
+    m->replaying = 1; m->replay_shown = 0;
+    m->replay_emit_from = last == AV_NOPTS_VALUE ? INT64_MAX : last - 27000;   // the last 0.3 s
+    m->v_wait_key = 0;                                         // the cache starts at a keyframe
+    struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int k = 0; k < total; k++) av_packet_route(m, CACHED(k));
+    #undef CACHED
+    m->replaying = 0;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    if (vdebug()) fprintf(stderr, "replayed %d packets%s in %.0f ms\n", total, use_prev ? " (from the previous GOP)" : "", (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
+    m->replays++;
+}
+
 void atsc_media_push(atsc_media *m, const uint8_t *pk, int ok) {
     m->pkts++;
     if (!ok || pk[0] != 0x47 || (pk[1] & 0x80)) { m->dropped++; return; }
+    int vpid = (pk[1] & 0x1F) << 8 | pk[2];
+    if (m->ngop) gop_cache_packet(m, vpid, pk);
+    av_packet_route(m, pk);
+}
+
+static void av_packet_route(atsc_media *m, const uint8_t *pk) {
     int pid = (pk[1] & 0x1F) << 8 | pk[2];
     int pusi = pk[1] & 0x40;
     int afc = (pk[3] >> 4) & 3;
