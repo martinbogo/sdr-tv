@@ -515,6 +515,8 @@ struct GuideRow: View {
                 Text(ch.number).font(.headline).monospacedDigit().frame(width: 52, alignment: .leading)
                 Text(ch.name).font(.headline.weight(.regular)).lineLimit(1)
                 if current { Image(systemName: "play.fill").font(.caption).foregroundStyle(.secondary) }
+                Spacer(minLength: 4)
+                if !ch.isUnavailable, ch.signalDB > 0 { SignalBars(bars: current ? tv.bars : ch.bars).scaleEffect(0.8) }
                 if ch.isUnavailable { Image(systemName: "antenna.radiowaves.left.and.right.slash").font(.caption).foregroundStyle(.orange).help("Weak signal last time") }
             }
             .frame(width: chWidth, alignment: .leading)
@@ -608,8 +610,10 @@ struct ChannelSettings: View {
                 Button("Scan for Channels…") { tv.beginSetup() }.disabled(tv.scanning)
                 if tv.scanning { ProgressView(value: tv.scanProgress).frame(width: 180) }
                 Spacer()
-                Text("\(tv.channels.count) channels").foregroundStyle(.secondary)
+                Text("\(tv.channels.count) of \(tv.allChannels.count) channels shown").foregroundStyle(.secondary)
             }
+            Text("Excellent: locks at normal gain with a clean signal. Good: needs extra gain or the RF amplifier, clean after that. Poor: everything else; these are unchecked automatically so they stay out of the channel list, guide and menus. Check one to show it anyway.")
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             Table(tv.allChannels) {
                 TableColumn("Show") { ch in
                     Toggle("", isOn: Binding(get: { !ch.hidden }, set: { tv.setHidden(ch, !$0) }))
@@ -620,14 +624,27 @@ struct ChannelSettings: View {
                 TableColumn("Channel") { ch in Text(ch.number).monospacedDigit() }.width(64)
                 TableColumn("Name", value: \.name)
                 TableColumn("RF") { ch in Text("\(ch.rf)").monospacedDigit() }.width(36)
-                TableColumn("Signal") { ch in
+                TableColumn("Reception") { ch in
+                    Text(ch.tierLabel)
+                        .foregroundStyle(ch.tier == 3 ? AnyShapeStyle(.orange) : ch.tier == nil ? AnyShapeStyle(.tertiary) : AnyShapeStyle(.primary))
+                        .help(ch.userKept == true ? "Poor reception, shown because you checked it." : ch.autoHidden == true ? "Unchecked automatically because of poor reception." : "")
+                }
+                .width(130)
+                TableColumn("Quality") { ch in
                     if ch.isUnavailable {
                         Text("Weak").foregroundStyle(.orange).help("Too weak last time it was tuned; choosing it retries.")
+                    } else if ch.signalDB > 0 {
+                        HStack(spacing: 6) {
+                            SignalBars(bars: ch.bars).environment(\.colorScheme, .dark)
+                                .padding(3).background(Color.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 3))
+                            Text(String(format: "%.0f dB", ch.signalDB)).monospacedDigit().foregroundStyle(.secondary)
+                        }
+                        .help("\(SignalQuality.label(bars: ch.bars)) when last watched. About 15 dB is needed to decode.")
                     } else {
-                        Text(ch.signalDB > 0 ? String(format: "%.0f dB", ch.signalDB) : "–").monospacedDigit()
+                        Text("–")
                     }
                 }
-                .width(70)
+                .width(100)
             }
         }
         .padding(20)
@@ -678,7 +695,9 @@ struct SetupSheet: View {
                         Text(ch.name)
                         Spacer()
                         Text("RF \(ch.rf)").foregroundStyle(.secondary).monospacedDigit()
-                        SignalBars(bars: bars(ch.signalDB)).environment(\.colorScheme, .dark)
+                        Text(ch.tierLabel + (ch.tier == 3 ? " · hidden" : "")).foregroundStyle(ch.tier == 3 ? .orange : .secondary)
+                            .frame(width: 170, alignment: .trailing)
+                        SignalBars(bars: ch.bars).environment(\.colorScheme, .dark)
                             .padding(4).background(Color.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 4))
                     }
                 }
@@ -715,7 +734,7 @@ struct SetupSheet: View {
 
     private var subtitle: String {
         if tv.deviceError != nil { return "Waiting for the HackRF" }
-        if tv.scanning { return "Finding the TV stations your antenna receives. This takes about two minutes." }
+        if tv.scanning { return "Finding the TV stations your antenna receives. This takes about three minutes, including each station's program guide." }
         if tv.scanResults.isEmpty { return "The scan found no digital TV stations." }
         return "Found \(tv.scanResults.count) channels. They are saved, so this runs only once."
     }
@@ -727,7 +746,6 @@ struct SetupSheet: View {
         return "\(phase)RF channel \(tv.scanRF) (\(Int(RFBand.centerMHz(tv.scanRF))) MHz) · \(tv.scanResults.count) found"
     }
 
-    private func bars(_ snr: Double) -> Int { snr < 15 ? 1 : snr < 18 ? 2 : snr < 21 ? 3 : 4 }
 }
 
 // MARK: - reception diagnostics

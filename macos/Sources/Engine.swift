@@ -208,8 +208,9 @@ final class Engine {
             if gen != seenGen {
                 if ProcessInfo.processInfo.environment["ATSC_DEBUG"] != nil { FileHandle.standardError.write("DSP reset (retune/gain) gen \(gen)\n".data(using: .utf8)!) }
                 seenGen = gen
-                // skip samples from before the retune (plus 20 ms for the tuner to settle)
-                Thread.sleep(forTimeInterval: 0.02)
+                // skip samples from before the retune: the tuner settling, and transfers still in
+                // flight on USB from the old frequency (they could decode as the old station)
+                Thread.sleep(forTimeInterval: newRF ? 0.06 : 0.02)
                 cursor = ring.written & ~1
                 if let rx { atsc_rx_reset(rx, hint) }
                 if newRF { cmdLock.lock(); cmdReset = true; cmdRF = rf; cmdLock.unlock() }

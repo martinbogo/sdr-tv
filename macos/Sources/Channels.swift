@@ -20,6 +20,26 @@ enum RFBand {
     static func pilotHint(_ rf: Int) -> Double { (centerMHz(rf) - 3) * 1e6 + 309_440.559 - Double(tuneHz(rf)) }
 }
 
+/// Signal quality, the same scale everywhere bars are shown. Quality is the equalizer's SNR on the
+/// known training sequence (and packet loss when it is known), not the input level: a strong but
+/// distorted signal (multipath) can have plenty of level and still not decode. About 15 dB is needed.
+enum SignalQuality {
+    static func bars(snr: Double, loss: Double = 0, locked: Bool = true) -> Int {
+        guard locked, snr > 0 else { return 0 }
+        if loss > 0.05 { return min(1, bars(snr: snr)) }      // data being lost: never more than 1
+        switch snr {
+        case ..<15: return 1
+        case ..<18: return 2
+        case ..<21: return 3
+        default: return 4
+        }
+    }
+
+    static func label(bars: Int) -> String {
+        ["No signal", "Poor", "Fair", "Good", "Excellent"][max(0, min(4, bars))]
+    }
+}
+
 struct VirtualChannel: Codable, Hashable, Identifiable {
     var rf: Int
     var major: Int
@@ -28,6 +48,7 @@ struct VirtualChannel: Codable, Hashable, Identifiable {
     var program: Int
     var sourceID: Int
     var hidden = false
+    /// Quality (SNR, dB) last measured on this RF channel with the receiver settled; 0 if never.
     var signalDB: Double = 0
     // receiver settings the scan found best for this RF channel (optional: older lists lack them)
     var lna: Int?
@@ -37,8 +58,40 @@ struct VirtualChannel: Codable, Hashable, Identifiable {
     /// up/down, retried when the user picks it. Separate from `hidden` (the user unchecked it).
     var unavailable: Bool?
     var bestSNR: Double?
+    /// Reception bucket: 1 excellent (locks at normal gain, clean), 2 good (needs extra gain or the
+    /// RF amplifier, clean after), 3 poor (everything else). Poor channels are unchecked
+    /// automatically; nil until measured.
+    var tier: Int?
+    /// The app unchecked it (poor reception), as opposed to the user.
+    var autoHidden: Bool?
+    /// The user checked a poor channel back on: keep showing it whatever its reception.
+    var userKept: Bool?
 
     var isUnavailable: Bool { unavailable ?? false }
+    /// Bars for the last measurement (none for a station marked weak).
+    var bars: Int { isUnavailable ? 0 : SignalQuality.bars(snr: signalDB) }
+
+    var tierLabel: String {
+        switch tier {
+        case 1: return "Excellent"
+        case 2: return amp == true ? "Good (RF amplifier)" : "Good (extra gain)"
+        case 3: return "Poor"
+        default: return "Not measured"
+        }
+    }
+
+    /// Put the channel in a bucket. Poor ones are unchecked unless the user chose to keep them;
+    /// a channel the app unchecked comes back when it is measured good again (by a scan).
+    mutating func assign(tier t: Int) {
+        tier = t
+        if t == 3 {
+            if userKept == true { unavailable = true }
+            else if !hidden { hidden = true; autoHidden = true }
+        } else {
+            unavailable = nil
+            if autoHidden == true { hidden = false; autoHidden = nil }
+        }
+    }
 
     var id: String { "\(major).\(minor)" }
     var number: String { "\(major).\(minor)" }
@@ -103,38 +156,90 @@ final class Library {
         save()
     }
 
+    /// Record a settled quality measurement for an RF channel (saved only when it moves by a dB or more).
+    func setQuality(rf: Int, snr: Double) {
+        guard let old = channels.first(where: { $0.rf == rf }), abs(old.signalDB - snr) >= 1 else { return }
+        for i in channels.indices where channels[i].rf == rf { channels[i].signalDB = snr }
+        save()
+    }
+
     func setChannels(_ list: [VirtualChannel]) {
-        channels = list.sorted { ($0.major, $0.minor) < ($1.major, $1.minor) }
+        // a channel number belongs to one RF channel: if it appears on two (samples from the previous
+        // frequency decoded just after a retune), keep the better-received one
+        var best: [String: VirtualChannel] = [:]
+        for c in list {
+            if let b = best[c.id] {
+                let better = (c.tier ?? 9, -c.signalDB) < (b.tier ?? 9, -b.signalDB)
+                if better { best[c.id] = c }
+            } else { best[c.id] = c }
+        }
+        channels = best.values.sorted { ($0.major, $0.minor) < ($1.major, $1.minor) }
         save()
     }
 
     /// Merge the channels found on one RF channel (replacing what was known for it). The receiver
     /// settings and weak mark belong to the RF channel, so they carry over to the new entries.
     func merge(rf: Int, found: [VirtualChannel]) {
+        let byID = Dictionary(channels.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
         let hiddenIDs = Set(channels.filter { $0.hidden }.map(\.id))
         let old = channels.first { $0.rf == rf }
         var list = channels.filter { $0.rf != rf }
         for var c in found {
             c.hidden = c.hidden || hiddenIDs.contains(c.id)
+            if let prev = byID[c.id] { c.autoHidden = prev.autoHidden; c.userKept = prev.userKept }
             if let old {
                 c.lna = c.lna ?? old.lna; c.vga = c.vga ?? old.vga; c.amp = c.amp ?? old.amp
                 c.unavailable = c.unavailable ?? old.unavailable; c.bestSNR = c.bestSNR ?? old.bestSNR
+                c.tier = c.tier ?? old.tier
+                if c.signalDB == 0 { c.signalDB = old.signalDB }
             }
             list.append(c)
         }
         setChannels(list)
     }
 
-    /// Replace the whole list with a fresh scan, keeping which channels the user hid.
-    func replaceAll(_ found: [VirtualChannel], keepingHiddenFrom old: [VirtualChannel]) {
-        let hiddenIDs = Set(old.filter { $0.hidden }.map(\.id))
-        setChannels(found.map { var c = $0; c.hidden = c.hidden || hiddenIDs.contains(c.id); return c })
+    /// Apply a finished scan. Stations it found replace what was known for their RF channels (keeping
+    /// which channels the user hid). Stations it did not find stay listed, marked weak: reception
+    /// comes and goes, and only the user removes channels (by unchecking them).
+    func applyScan(_ found: [VirtualChannel]) {
+        let byID = Dictionary(channels.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        let foundRFs = Set(found.map(\.rf))
+        var list: [VirtualChannel] = []
+        for var c in found {
+            let t = c.tier ?? 3
+            if let prev = byID[c.id] {
+                // the user's own unchecking stands; the app's is undone by a good measurement (assign)
+                c.hidden = prev.hidden
+                c.autoHidden = prev.autoHidden; c.userKept = prev.userKept
+            }
+            c.unavailable = nil
+            c.assign(tier: t)
+            list.append(c)
+        }
+        let foundIDs = Set(list.map(\.id))
+        for var c in channels where !foundRFs.contains(c.rf) && !foundIDs.contains(c.id) {
+            c.assign(tier: 3)                       // not received this time: poor
+            list.append(c)
+        }
+        setChannels(list)
     }
 
+    /// Reception measured while watching: every channel on the RF channel moves to bucket `t`.
+    func setTier(rf: Int, _ t: Int) {
+        for i in channels.indices where channels[i].rf == rf { channels[i].assign(tier: t) }
+        save()
+    }
+
+    /// The user checks or unchecks a channel in Settings.
     func setHidden(_ id: String, _ hidden: Bool) {
         if let i = channels.firstIndex(where: { $0.id == id }) {
             channels[i].hidden = hidden
-            if !hidden { channels[i].unavailable = nil }     // re-enabling it clears the weak mark
+            channels[i].autoHidden = nil
+            if hidden { channels[i].userKept = nil }
+            else {
+                channels[i].unavailable = nil               // re-enabling it clears the weak mark
+                if channels[i].tier == 3 { channels[i].userKept = true }
+            }
             save()
         }
     }

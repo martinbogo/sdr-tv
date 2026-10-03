@@ -16,6 +16,19 @@ final class SampleRing {
 
     var written: Int { cond.lock(); defer { cond.unlock() }; return total }
 
+    /// Power of the newest `bytes` of samples in dBFS (for gain setting: unlike the receiver's own
+    /// level reading, this cannot lag behind a gain change). `after`: only count data written since then.
+    func recentLevel(bytes: Int = 400_000, after: Int = 0) -> Double? {
+        cond.lock(); defer { cond.unlock() }
+        let n = min(bytes, total - after) & ~1
+        guard n >= 20_000 else { return nil }
+        var pw = 0.0
+        for k in 0..<n {
+            let v = Double(buf[(total - n + k) % size]); pw += v * v
+        }
+        return 10 * log10(max(pw / Double(n / 2), 1e-9)) - 20 * log10(128)
+    }
+
     func write(_ p: UnsafeRawPointer, _ n: Int) {
         cond.lock()
         var src = p.assumingMemoryBound(to: Int8.self), left = n
