@@ -115,6 +115,10 @@ int atsc_media_selected_pids(atsc_media *m, int *pids, int max);
 /// so once nothing new has come for a few seconds the guide it carries is complete.
 void atsc_media_guide_progress(atsc_media *m, int *sections, uint64_t *packets_since_new);
 
+/// PIDs to record any program of this RF channel (PAT, its PMT, PSIP, video and every audio track),
+/// whether or not it is the one being decoded. Returns 0 until its PMT has been received.
+int atsc_media_program_pids(atsc_media *m, int program, int *pids, int max);
+
 /// The program number currently being decoded, or -1.
 int atsc_media_current_program(atsc_media *m);
 

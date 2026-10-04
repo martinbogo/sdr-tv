@@ -118,6 +118,22 @@ struct LibraryTests {
         print("Schedules Direct")
         check(SchedulesDirect.passwordHash("password") == "5baa61e4c9b93f3f0682250b6cf8331b7ee68fd8", "password sent as its SHA-1 hex, as the API expects")
 
+        print("recording schedule")
+        let sched = RecordingSchedule()
+        for r in sched.items { sched.remove(r.id) }
+        let soon = Date().addingTimeInterval(3600)
+        let a = ScheduledRecording(channelID: "8.1", channelName: "KGW", rf: 26, program: 3, title: "A", start: soon, end: soon.addingTimeInterval(1800))
+        let b = ScheduledRecording(channelID: "8.2", channelName: "Quest", rf: 26, program: 4, title: "B", start: soon, end: soon.addingTimeInterval(1800))
+        let c = ScheduledRecording(channelID: "2.1", channelName: "KATU", rf: 24, program: 3, title: "C", start: soon.addingTimeInterval(1500), end: soon.addingTimeInterval(3600))
+        sched.add(a); sched.add(b); sched.add(c)
+        check(sched.conflicts(with: b).map(\.title) == ["C"], "same station records together; another station overlapping conflicts")
+        check(sched.scheduled(channelID: "8.1", start: soon.addingTimeInterval(20))?.title == "A", "found by channel and start time")
+        var past = ScheduledRecording(channelID: "8.1", channelName: "KGW", rf: 26, program: 3, title: "Old", start: Date().addingTimeInterval(-7200), end: Date().addingTimeInterval(-3600))
+        past.state = .scheduled; sched.add(past)
+        let reloaded = RecordingSchedule()
+        check(reloaded.items.first { $0.title == "Old" }?.state == .missed, "a recording due while the app was closed is marked missed")
+        for r in reloaded.items { reloaded.remove(r.id) }
+
         print(failures == 0 ? "library: all passed" : "library: \(failures) failed")
         exit(failures == 0 ? 0 : 1)
     }

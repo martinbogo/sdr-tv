@@ -91,6 +91,13 @@ final class TV: ObservableObject {
     @Published var setupVisible = false             // modal scan window (first run, or a rescan)
     var firstRun: Bool { !defaults.bool(forKey: "initialScanDone") }
     @Published private(set) var recordingSince: Date?
+    // scheduled recordings
+    let schedule = RecordingSchedule()
+    @Published private(set) var scheduleTick = 0                  // bumps when the schedule changes
+    @Published private(set) var activeRecordings: [ScheduledRecording] = []
+    private var warnedRecordings = Set<UUID>()
+    private var blockedTuneAt: (id: String, at: Date)?
+    private var awake: NSObjectProtocol?
 
     private var bannerTimer: DispatchWorkItem?
     private var volumeTimer: DispatchWorkItem?
@@ -238,8 +245,18 @@ final class TV: ObservableObject {
         }
     }
 
-    func tune(_ ch: VirtualChannel, showBanner: Bool = true) {
+    func tune(_ ch: VirtualChannel, showBanner: Bool = true, forRecording: Bool = false) {
         guard deviceError == nil else { return }
+        // a scheduled recording holds the tuner on its station: another station stops it, so ask first
+        if !forRecording, let rec = activeRecordings.first(where: { $0.rf != ch.rf }) {
+            if let b = blockedTuneAt, b.id == ch.id, Date().timeIntervalSince(b.at) < 6 {
+                for r in activeRecordings where r.rf != ch.rf { finishRecording(r, note: "Stopped early: changed station") }
+            } else {
+                blockedTuneAt = (ch.id, Date())
+                flash("Recording \"\(rec.title)\" until \(rec.recordUntil.formatted(date: .omitted, time: .shortened)). Channels from the same station still work; choose \(ch.number) again to stop the recording and change.", seconds: 6)
+                return
+            }
+        }
         if current?.id != ch.id { captureStill() }
         liveShown = false
         still = current?.id == ch.id && hasPicture ? nil : snapshots.still(for: ch.id)
@@ -835,6 +852,7 @@ final class TV: ObservableObject {
     func toggleRecording() {
         if recordingSince != nil {
             engine.stopRecording(); recordingSince = nil
+            updateAwake()
             flash("Recording saved to Movies/SDR TV")
             return
         }
@@ -847,8 +865,112 @@ final class TV: ObservableObject {
             let url = Self.recordingsFolder.appendingPathComponent("\(ch.number) \(ch.name) - \(safe) - \(f.string(from: Date())).ts")
             try engine.startRecording(to: url)
             recordingSince = Date()
+            updateAwake()
         } catch {
             flash("Could not record: \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: scheduled recordings
+
+    /// Schedule (or, if already scheduled, cancel) recording a guide program.
+    func toggleScheduledRecording(_ ch: VirtualChannel, _ e: GuideEvent) {
+        if let existing = schedule.scheduled(channelID: ch.id, start: e.start) {
+            cancelRecording(existing)
+            return
+        }
+        guard e.end > Date() else { flash("That program has ended"); return }
+        let r = ScheduledRecording(channelID: ch.id, channelName: ch.name, rf: ch.rf, program: ch.program,
+                                   title: e.title, start: e.start, end: e.end)
+        schedule.add(r)
+        scheduleTick &+= 1
+        let clash = schedule.conflicts(with: r)
+        if let c = clash.first {
+            flash("Scheduled \"\(e.title)\", but it overlaps \"\(c.title)\" on another station. One tuner receives one station at a time: the one that starts first is recorded.", seconds: 8)
+        } else {
+            flash("Will record \"\(e.title)\" on \(ch.number) at \(e.start.formatted(date: .omitted, time: .shortened))")
+        }
+        superviseSchedule()
+    }
+
+    /// Record the program on now, to its end (falls back to manual recording without a guide entry).
+    func recordThisProgram() {
+        guard let ch = current else { return }
+        if let e = library.now(ch.guideKey).0 { toggleScheduledRecording(ch, e) } else { toggleRecording() }
+    }
+
+    func cancelRecording(_ r: ScheduledRecording) {
+        if r.state == .recording { finishRecording(r, note: "Stopped early") }
+        else { schedule.remove(r.id); scheduleTick &+= 1; flash("Recording of \"\(r.title)\" cancelled") }
+    }
+
+    func deleteScheduleEntry(_ r: ScheduledRecording) {
+        if r.state == .recording { finishRecording(r, note: "Stopped early") }
+        schedule.remove(r.id); scheduleTick &+= 1
+    }
+
+    private func finishRecording(_ r0: ScheduledRecording, note: String? = nil) {
+        var r = r0
+        engine.stopRecorder(id: r.id.uuidString)
+        r.state = .done; r.note = note
+        schedule.update(r)
+        activeRecordings.removeAll { $0.id == r.id }
+        scheduleTick &+= 1
+        updateAwake()
+        flash("Recording of \"\(r.title)\" saved to Movies/SDR TV")
+    }
+
+    /// Start and stop scheduled recordings on time (called every couple of seconds).
+    private func superviseSchedule() {
+        let now = Date()
+        for var r in schedule.items where r.state == .scheduled {
+            if now > r.recordUntil { r.state = .missed; r.note = r.note ?? "Could not start in time"; schedule.update(r); scheduleTick &+= 1; continue }
+            let needsTune = engine.currentRF != r.rf || current == nil
+            // a minute's warning before taking over the tuner
+            if needsTune, now >= r.recordFrom.addingTimeInterval(-60), !warnedRecordings.contains(r.id) {
+                warnedRecordings.insert(r.id)
+                flash("Recording \"\(r.title)\" on \(r.channelID) starts in a minute; SDR TV will tune to it.", seconds: 8)
+            }
+            guard now >= r.recordFrom.addingTimeInterval(-8) else { continue }
+            if needsTune {
+                if let other = activeRecordings.first(where: { $0.rf != r.rf }) {
+                    r.state = .failed; r.note = "Overlapped \"\(other.title)\" on another station"; schedule.update(r); scheduleTick &+= 1
+                    continue
+                }
+                let ch = library.channels.first { $0.id == r.channelID }
+                    ?? VirtualChannel(rf: r.rf, major: 0, minor: 0, name: r.channelName, program: r.program, sourceID: 0)
+                tune(ch, forRecording: true)
+                continue                                    // start once the station's program map is in
+            }
+            guard now >= r.recordFrom else { continue }
+            do {
+                try FileManager.default.createDirectory(at: Self.recordingsFolder, withIntermediateDirectories: true)
+                let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd 'at' HH.mm"
+                let safe = r.title.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
+                let url = Self.recordingsFolder.appendingPathComponent("\(r.channelID) \(r.channelName) - \(safe) - \(f.string(from: r.start)).ts")
+                if try engine.startRecording(id: r.id.uuidString, program: r.program, to: url) {
+                    r.state = .recording; r.file = url.path
+                    schedule.update(r); activeRecordings.append(r); scheduleTick &+= 1
+                    updateAwake()
+                    flash("Recording \"\(r.title)\"")
+                }
+            } catch {
+                r.state = .failed; r.note = error.localizedDescription; schedule.update(r); scheduleTick &+= 1
+            }
+        }
+        for r in activeRecordings where now >= r.recordUntil { finishRecording(r) }
+        updateAwake()
+    }
+
+    /// Keep the Mac from sleeping while recording, or about to.
+    private func updateAwake() {
+        let soon = Date().addingTimeInterval(180)
+        let need = !activeRecordings.isEmpty || recordingSince != nil
+            || schedule.items.contains { $0.state == .scheduled && $0.recordFrom < soon && $0.recordUntil > Date() }
+        if need, awake == nil {
+            awake = ProcessInfo.processInfo.beginActivity(options: [.idleSystemSleepDisabled, .suddenTerminationDisabled], reason: "Recording TV")
+        } else if !need, let a = awake {
+            ProcessInfo.processInfo.endActivity(a); awake = nil
         }
     }
 
@@ -1023,6 +1145,7 @@ final class TV: ObservableObject {
             gainTestTicks += 1
             if gainTestTicks % 10 == 0 { vga = vga == 20 ? 22 : 20 }
         }
+        if !scanning, !guideRefreshing, snapshotTicks % 4 == 0 { superviseSchedule() }
         if scanning || rechecking || guideRefreshing { return }
         noteGuideWhileWatching()
         noteQualityWhileWatching(s)

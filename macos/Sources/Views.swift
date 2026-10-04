@@ -96,6 +96,7 @@ struct TVScreen: View {
                 VStack(alignment: .trailing, spacing: 12) {
                     if !tv.entry.isEmpty { EntryOSD(text: tv.entry) }
                     if let since = tv.recordingSince { RecordingOSD(since: since) }
+                    ForEach(tv.activeRecordings) { r in RecordingOSD(since: r.recordFrom, title: r.title) }
                     if tv.weakSignal { WeakSignalOSD() }
                     Spacer()
                     if tv.volumeVisible { VolumeOSD() .transition(.opacity) }
@@ -288,12 +289,14 @@ struct EntryOSD: View {
 
 struct RecordingOSD: View {
     let since: Date
+    var title: String? = nil
     var body: some View {
         TimelineView(.periodic(from: since, by: 1)) { ctx in
-            let s = Int(ctx.date.timeIntervalSince(since))
+            let s = max(0, Int(ctx.date.timeIntervalSince(since)))
             HStack(spacing: 6) {
                 Circle().fill(.red).frame(width: 10, height: 10)
                 Text(String(format: "REC %d:%02d:%02d", s / 3600, s / 60 % 60, s % 60)).monospacedDigit()
+                if let title { Text(title).lineLimit(1).frame(maxWidth: 220) }
             }
             .font(.callout.weight(.semibold)).foregroundStyle(.white)
             .padding(.horizontal, 12).padding(.vertical, 6)
@@ -438,7 +441,7 @@ struct GuideOSD: View {
                     let focus = startOffset == 0 ? Date() : start.addingTimeInterval(1)
                     GuideDetails(ch: tv.channels[row], at: focus).padding(.top, 12)
                 }
-                Text("↑↓ choose  ·  ←→ time  ·  Return watch  ·  U update guide  ·  Esc or G close")
+                Text("↑↓ choose  ·  ←→ time  ·  Return watch  ·  R record  ·  U update guide  ·  Esc or G close")
                     .font(.caption).foregroundStyle(.secondary).padding(.top, 10)
             }
             .padding(24)
@@ -471,6 +474,11 @@ struct GuideOSD: View {
                 switch press.characters.lowercased() {
                 case "g": tv.guideVisible = false
                 case "u": tv.guideRefreshing ? tv.cancelGuideRefresh() : tv.refreshGuide()
+                case "r":
+                    if tv.channels.indices.contains(row) {
+                        let ch = tv.channels[row], at = startOffset == 0 ? Date() : slotStart.addingTimeInterval(1)
+                        if let e = tv.library.events(ch.guideKey, from: at, to: at.addingTimeInterval(1)).first { tv.toggleScheduledRecording(ch, e) }
+                    }
                 default: return .ignored
                 }
             }
@@ -518,6 +526,12 @@ struct GuideDetails: View {
                 let caps = e.captions == true ? "Captions" + ((e.captionLangs?.isEmpty ?? true) ? "" : " in " + e.captionLangs!.map(languageName).joined(separator: ", ")) : "No captions announced"
                 let audio = (e.audioLangs?.isEmpty ?? true) ? "" : "  ·  Audio in " + e.audioLangs!.map(languageName).joined(separator: ", ")
                 Text(caps + audio).font(.callout).foregroundStyle(.secondary)
+                if let rec = tv.schedule.scheduled(channelID: ch.id, start: e.start) {
+                    Label(rec.state == .recording ? "Recording now" : "Will be recorded (R cancels)", systemImage: "record.circle")
+                        .font(.callout.weight(.semibold)).foregroundStyle(.red)
+                } else if e.end > Date() {
+                    Text("Press R to record").font(.caption).foregroundStyle(.tertiary)
+                }
                 if let src = e.source {
                     Text("Listing: " + src).font(.caption).foregroundStyle(.tertiary).lineLimit(2)
                 }
@@ -623,6 +637,9 @@ struct GuideRow: View {
                     let x1 = min(span, e.end.timeIntervalSince(from)) / span * Double(width)
                     let live = e.start <= Date() && Date() < e.end
                     HStack(spacing: 6) {
+                        if tv.schedule.scheduled(channelID: ch.id, start: e.start) != nil {
+                            Circle().fill(.red).frame(width: 8, height: 8).accessibilityLabel("Scheduled to record")
+                        }
                         Text(e.title).font(.callout).lineLimit(1)
                         if x1 - x0 > 150 {
                             Spacer(minLength: 0)
@@ -894,8 +911,44 @@ struct ChannelSettings: View {
 
 struct RecordingSettings: View {
     @EnvironmentObject var tv: TV
+    private func stateText(_ r: ScheduledRecording) -> String {
+        switch r.state {
+        case .scheduled: return "Scheduled"
+        case .recording: return "Recording"
+        case .done: return "Recorded"
+        case .failed: return "Failed"
+        case .missed: return "Missed"
+        }
+    }
     var body: some View {
         Form {
+            Section("Scheduled") {
+                let _ = tv.scheduleTick
+                let items = tv.schedule.items.sorted { $0.start < $1.start }
+                if items.isEmpty {
+                    Text("Nothing scheduled. In the guide, choose a program and press R, or use Controls > Record This Program.")
+                        .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+                ForEach(items) { r in
+                    HStack(alignment: .firstTextBaseline) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(r.title).font(.body.weight(.medium)).lineLimit(1)
+                            Text("\(r.channelID) \(r.channelName) · \(r.start.formatted(.dateTime.weekday(.abbreviated).hour().minute())) to \(r.end.formatted(date: .omitted, time: .shortened))")
+                                .font(.caption).foregroundStyle(.secondary)
+                            if let n = r.note { Text(n).font(.caption).foregroundStyle(.orange) }
+                        }
+                        Spacer()
+                        Text(stateText(r)).font(.caption.weight(.semibold)).foregroundStyle(r.state == .recording ? .red : .secondary)
+                        Button(role: .destructive) { tv.deleteScheduleEntry(r) } label: {
+                            Image(systemName: r.state == .scheduled ? "xmark.circle" : r.state == .recording ? "stop.circle" : "trash")
+                        }
+                        .buttonStyle(.borderless)
+                        .help(r.state == .scheduled ? "Cancel" : r.state == .recording ? "Stop recording" : "Remove from list (the file stays)")
+                    }
+                }
+                Text("SDR TV must be running (it keeps the Mac awake while recording). It tunes to the station a few seconds early, records a minute before to two minutes after, and has one tuner: one station at a time, though programs on the same station can record together.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
             LabeledContent("Saved to", value: "Movies/SDR TV")
             Button("Show Recordings in Finder") { tv.revealRecordings() }
             Text("Recordings are the broadcast stream saved exactly as received (MPEG transport stream, .ts): the channel's video, audio and guide data with no re-encoding. Play them with VLC or IINA.")

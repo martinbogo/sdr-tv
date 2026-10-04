@@ -742,6 +742,21 @@ int atsc_media_selected_pids(atsc_media *m, int *pids, int max) {
     return n;
 }
 
+int atsc_media_program_pids(atsc_media *m, int program, int *pids, int max) {
+    int pmt = -1, n = 0;
+    for (int k = 0; k < m->nprog; k++) if (m->prog_list[k] == program) pmt = m->prog_pmt[k];
+    for (int k = 0; k < npmt; k++) {
+        if (pmts[k].prog != program) continue;
+        if (pmt < 0 || pmts[k].video <= 0) return 0;          // not mapped yet
+        int cand[3] = {0x0000, pmt, 0x1FFB};
+        for (int i = 0; i < 3 && n < max; i++) pids[n++] = cand[i];
+        if (n < max) pids[n++] = pmts[k].video;
+        for (int a = 0; a < pmts[k].naud && n < max; a++) pids[n++] = pmts[k].aud[a].pid;   // every language
+        return n;
+    }
+    return 0;
+}
+
 int atsc_media_current_program(atsc_media *m) { return m->cur_program; }
 
 void atsc_media_select(atsc_media *m, int program) {

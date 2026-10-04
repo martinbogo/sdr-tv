@@ -43,9 +43,9 @@ final class Engine {
 
     // recording
     private let recLock = NSLock()
-    private var recFile: FileHandle?
-    private var recPIDs = Set<Int>()
-    private var recBuffer = Data()
+    /// Recordings in progress (several programs of one RF channel can be recorded at once).
+    private struct Recorder { var file: FileHandle; var pids: Set<Int>; var buffer = Data() }
+    private var recorders: [String: Recorder] = [:]
 
     // app callbacks (main thread)
     var onChannels: (([VirtualChannel]) -> Void)?
@@ -322,30 +322,48 @@ final class Engine {
 
     // MARK: recording
 
+    /// The program being watched (manual recording, R).
     func startRecording(to url: URL) throws {
-        FileManager.default.createFile(atPath: url.path, contents: nil)
-        let fh = try FileHandle(forWritingTo: url)
         var pids = [Int32](repeating: 0, count: 8)
         let n = media.map { atsc_media_selected_pids($0, &pids, 8) } ?? 0
-        recLock.lock()
-        recFile = fh; recPIDs = Set(pids.prefix(Int(n)).map(Int.init)); recBuffer.removeAll()
-        recLock.unlock()
+        try startRecorder(id: "manual", pids: Set(pids.prefix(Int(n)).map(Int.init)), to: url)
     }
 
-    func stopRecording() {
+    func stopRecording() { stopRecorder(id: "manual") }
+
+    /// Any program of the RF channel being received. Returns false until its streams are known
+    /// (the program map arrives within ~0.1 s of tuning); call again.
+    func startRecording(id: String, program: Int, to url: URL) throws -> Bool {
+        var pids = [Int32](repeating: 0, count: 16)
+        let n = media.map { atsc_media_program_pids($0, Int32(program), &pids, 16) } ?? 0
+        guard n > 0 else { return false }
+        try startRecorder(id: id, pids: Set(pids.prefix(Int(n)).map(Int.init)), to: url)
+        return true
+    }
+
+    func isRecording(id: String) -> Bool { recLock.lock(); defer { recLock.unlock() }; return recorders[id] != nil }
+
+    private func startRecorder(id: String, pids: Set<Int>, to url: URL) throws {
+        FileManager.default.createFile(atPath: url.path, contents: nil)
+        let fh = try FileHandle(forWritingTo: url)
+        recLock.lock(); recorders[id] = Recorder(file: fh, pids: pids); recLock.unlock()
+    }
+
+    func stopRecorder(id: String) {
         recLock.lock()
-        if let f = recFile { try? f.write(contentsOf: recBuffer); try? f.close() }
-        recFile = nil; recBuffer.removeAll()
+        if let r = recorders.removeValue(forKey: id) { try? r.file.write(contentsOf: r.buffer); try? r.file.close() }
         recLock.unlock()
     }
 
     private func record(_ p: UnsafePointer<UInt8>) {
         recLock.lock(); defer { recLock.unlock() }
-        guard let f = recFile else { return }
+        guard !recorders.isEmpty else { return }
         let pid = Int(p[1] & 0x1F) << 8 | Int(p[2])
-        guard recPIDs.contains(pid) else { return }
-        recBuffer.append(p, count: 188)
-        if recBuffer.count >= 1 << 20 { try? f.write(contentsOf: recBuffer); recBuffer.removeAll(keepingCapacity: true) }
+        for (id, var r) in recorders where r.pids.contains(pid) {
+            r.buffer.append(p, count: 188)
+            if r.buffer.count >= 1 << 20 { try? r.file.write(contentsOf: r.buffer); r.buffer.removeAll(keepingCapacity: true) }
+            recorders[id] = r
+        }
     }
 }
 

@@ -32,6 +32,7 @@ struct TVCommands: Commands {
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
             Button(tv.recordingSince == nil ? "Start Recording" : "Stop Recording") { tv.toggleRecording() }
+            Button("Record This Program") { tv.recordThisProgram() }.keyboardShortcut("r", modifiers: [.command, .shift])
                 .keyboardShortcut("r")
             Button("Show Recordings in Finder") { tv.revealRecordings() }
         }
