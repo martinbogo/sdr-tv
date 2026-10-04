@@ -280,8 +280,8 @@ final class TV: ObservableObject {
     /// dBFS for the RF channel just tuned. Runs on the scan thread. Returns the settings used.
     private func settleGain(target: Double, allowAmp: Bool) -> (lna: Int, vga: Int, amp: Bool, dbfs: Double) {
         var l = 24, v = 20, amp = false
-        let dev = engine.device
-        dev?.setAmp(false); dev?.setLNA(l); dev?.setVGA(v)
+        let dev = engine.device                     // background thread: gain changes wait until applied
+        dev?.setAmp(false, wait: true); dev?.setLNA(l, wait: true); dev?.setVGA(v, wait: true)
         var level = -100.0
         for _ in 0..<6 {
             // measure only samples taken after the gain change has settled in the tuner (~10 ms)
@@ -295,13 +295,13 @@ final class TV: ObservableObject {
             if nv > 62 { rest = nv - 62; nv = 62 } else if nv < 0 { rest = nv; nv = 0 }
             if rest > 4, l <= 32 { l += 8; nv = max(0, nv - 8) }
             else if rest < -4, l >= 8 { l -= 8; nv = min(62, nv + 8) }
-            else if rest > 6, l == 40, v == 62, allowAmp, !amp { amp = true; dev?.setAmp(true) }
+            else if rest > 6, l == 40, v == 62, allowAmp, !amp { amp = true; dev?.setAmp(true, wait: true) }
             if nv == v && rest == 0 { break }
             v = nv
-            dev?.setLNA(l); dev?.setVGA(v)
+            dev?.setLNA(l, wait: true); dev?.setVGA(v, wait: true)
         }
         // front-end protection, as in normal viewing
-        if amp && level > -6 { amp = false; dev?.setAmp(false) }
+        if amp && level > -6 { amp = false; dev?.setAmp(false, wait: true) }
         return (l, v, amp, level)
     }
 

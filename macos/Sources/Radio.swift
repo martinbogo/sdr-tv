@@ -81,6 +81,9 @@ final class HackRFDevice {
     private var dev: OpaquePointer?
     private let ring: SampleRing
     private static var libraryReady = false
+    /// Every libhackrf call goes through this one serial queue. Control requests are USB transfers
+    /// that libhackrf waits on without a timeout: a USB hiccup must never freeze the main thread.
+    static let control = DispatchQueue(label: "hackrf.control", qos: .userInteractive)
 
     init(ring: SampleRing) { self.ring = ring }
 
@@ -89,13 +92,20 @@ final class HackRFDevice {
     }
 
     func open() throws {
-        if !Self.libraryReady { try check(hackrf_init(), "hackrf_init"); Self.libraryReady = true }
-        var d: OpaquePointer?
-        try check(hackrf_open(&d), "hackrf_open")
-        dev = d
+        // after any queued work (a previous device closing must finish before this one opens)
+        try Self.control.sync {
+            if !Self.libraryReady { try check(hackrf_init(), "hackrf_init"); Self.libraryReady = true }
+            var d: OpaquePointer?
+            try check(hackrf_open(&d), "hackrf_open")
+            dev = d
+        }
     }
 
     func start(freq: UInt64, amp: Bool, lna: Int, vga: Int) throws {
+        try Self.control.sync { try startNow(freq: freq, amp: amp, lna: lna, vga: vga) }
+    }
+
+    private func startNow(freq: UInt64, amp: Bool, lna: Int, vga: Int) throws {
         guard let dev else { throw RadioError.call("hackrf_open", HACKRF_ERROR_NOT_FOUND.rawValue) }
         try check(hackrf_set_sample_rate(dev, 20_000_000), "hackrf_set_sample_rate")
         try check(hackrf_set_baseband_filter_bandwidth(dev, hackrf_compute_baseband_filter_bw(15_000_000)),
@@ -113,18 +123,26 @@ final class HackRFDevice {
         }, ctx), "hackrf_start_rx")
     }
 
-    func setFrequency(_ hz: UInt64) { if let dev { _ = hackrf_set_freq(dev, hz) } }
-    func setAmp(_ on: Bool) { if let dev { _ = hackrf_set_amp_enable(dev, on ? 1 : 0) } }
-    func setLNA(_ db: Int) { if let dev { _ = hackrf_set_lna_gain(dev, UInt32(db)) } }
-    func setVGA(_ db: Int) { if let dev { _ = hackrf_set_vga_gain(dev, UInt32(db)) } }
+    // Frequency and gain changes are queued (in order) and return at once. `wait: true` blocks
+    // until applied: only for background threads that measure the result (gain setting in scans).
+    private func control(wait: Bool, _ work: @escaping (OpaquePointer) -> Void) {
+        guard let d = dev else { return }
+        if wait { Self.control.sync { work(d) } } else { Self.control.async { work(d) } }
+    }
+    func setFrequency(_ hz: UInt64, wait: Bool = false) { control(wait: wait) { _ = hackrf_set_freq($0, hz) } }
+    func setAmp(_ on: Bool, wait: Bool = false) { control(wait: wait) { _ = hackrf_set_amp_enable($0, on ? 1 : 0) } }
+    func setLNA(_ db: Int, wait: Bool = false) { control(wait: wait) { _ = hackrf_set_lna_gain($0, UInt32(db)) } }
+    func setVGA(_ db: Int, wait: Bool = false) { control(wait: wait) { _ = hackrf_set_vga_gain($0, UInt32(db)) } }
 
     var isStreaming: Bool {
         guard let dev else { return false }
         return hackrf_is_streaming(dev) == HACKRF_TRUE.rawValue
     }
 
+    /// Returns at once; the device is stopped and closed on the control queue.
     func close() {
-        if let dev { _ = hackrf_stop_rx(dev); _ = hackrf_close(dev) }
+        guard let d = dev else { return }
         dev = nil
+        Self.control.async { _ = hackrf_stop_rx(d); _ = hackrf_close(d) }
     }
 }

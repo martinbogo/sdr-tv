@@ -38,6 +38,25 @@ final class Player {
     private(set) var latency: Int64 = 36_000     // 0.4 s in 90 kHz ticks
     private var stillShown = false
     private var firstFrameOnScreen = false
+    // AVFoundation is never called while `lock` is held (the main thread takes the lock on every
+    // channel change and for captions): clock changes and samples are collected under the lock and
+    // applied after it is released.
+    private var pendingClock: (rate: Float, time: CMTime)?
+    private var pendingVideo: [CMSampleBuffer] = []
+    private var pendingAudio: CMSampleBuffer?
+    private var clockNow = CMTime.invalid           // the synchronizer's time, read before locking
+    private var epoch = 0                           // bumped by flush()
+
+    /// Call with `lock` held: releases it, then applies what was collected.
+    private func unlockAndApply() {
+        let c = pendingClock, v = pendingVideo, a = pendingAudio, e = epoch
+        pendingClock = nil; pendingVideo.removeAll(); pendingAudio = nil
+        lock.unlock()
+        if let c { sync.setRate(c.rate, time: c.time) }
+        guard e == epoch else { return }             // a channel change came in between: drop old samples
+        for sb in v { layer.sampleBufferRenderer.enqueue(sb) }
+        if let a { audio.enqueue(a) }
+    }
     private var flushedAt = Date()
     private let debug = ProcessInfo.processInfo.environment["ATSC_DEBUG"] != nil
     private func note(_ what: String) {
@@ -63,10 +82,9 @@ final class Player {
 
     /// Drop everything queued (channel change).
     func flush() {
-        lock.lock(); defer { lock.unlock() }
-        sync.setRate(0, time: .zero)
-        layer.sampleBufferRenderer.flush(removingDisplayedImage: true, completionHandler: nil)
-        audio.flush()
+        lock.lock()
+        epoch += 1
+        pendingClock = nil; pendingVideo.removeAll(); pendingAudio = nil
         started = false
         stillShown = false
         firstFrameOnScreen = false
@@ -78,6 +96,10 @@ final class Player {
         captionQueue.removeAll()
         DispatchQueue.main.async { [weak self] in self?.onCaption?("{\"regions\":[]}") }
         pendingSince = nil
+        lock.unlock()
+        sync.setRate(0, time: .zero)
+        layer.sampleBufferRenderer.flush(removingDisplayedImage: true, completionHandler: nil)
+        audio.flush()
     }
 
     /// 33-bit PTS -> monotonic 64-bit ticks (stream 0 = video, 1 = audio).
@@ -105,12 +127,12 @@ final class Player {
             if !stillShown {
                 // show the first picture right away as a still: the clock (paused) is put at its time
                 stillShown = true
-                sync.setRate(0, time: CMTime(value: pts, timescale: 90_000))
+                pendingClock = (0, CMTime(value: pts, timescale: 90_000))
             }
             if pendingSince == nil { pendingSince = Date() }
             if Date().timeIntervalSince(pendingSince!) < 1.0 { return }
         }
-        sync.setRate(1, time: CMTime(value: pts - latency, timescale: 90_000))
+        pendingClock = (1, CMTime(value: pts - latency, timescale: 90_000))
         started = true
         note(isAudio ? "playing (sound)" : "playing (no sound)")
     }
@@ -118,11 +140,11 @@ final class Player {
     /// Keeps the audio device clock and the broadcast clock from drifting apart over hours.
     private func checkDrift() {
         guard started else { return }
-        let now = sync.currentTime()
+        let now = clockNow
         guard now.isValid else { return }
         let lead = latestPTS - Int64(now.seconds * 90_000)
         if lead > 4 * 90_000 || lead < -90_000 {
-            sync.setRate(1, time: CMTime(value: latestPTS - latency, timescale: 90_000))
+            pendingClock = (1, CMTime(value: latestPTS - latency, timescale: 90_000))
         }
     }
 
@@ -152,9 +174,10 @@ final class Player {
     }
 
     private func releaseCaptions() {
+        let t = sync.currentTime()                      // outside the lock
         lock.lock()
-        guard started else { lock.unlock(); return }
-        let now = Int64(sync.currentTime().seconds * 90_000)
+        guard started, t.isValid else { lock.unlock(); return }
+        let now = Int64(t.seconds * 90_000)
         var due: String?
         while let first = captionQueue.first, first.pts <= now {
             due = first.json
@@ -168,7 +191,9 @@ final class Player {
 
     func video(y: UnsafePointer<UInt8>, u: UnsafePointer<UInt8>, v: UnsafePointer<UInt8>,
                yStride: Int, uvStride: Int, width: Int, height: Int, sarNum: Int, sarDen: Int, pts rawPTS: Int64) {
-        lock.lock(); defer { lock.unlock() }
+        let t = sync.currentTime()
+        lock.lock(); defer { unlockAndApply() }
+        clockNow = t
         guard rawPTS != Int64.min else { return }
         let pts = unwrap(rawPTS, 0)
         latestPTS = max(latestPTS, pts)
@@ -230,19 +255,19 @@ final class Player {
             // the first picture after a channel change goes up now, not when the clock reaches it:
             // a copy timed at the clock's current position, then the frame itself at its own time
             firstFrameOnScreen = true
-            let now = sync.currentTime()
+            let now = clockNow
             if started, now.isValid, pts > Int64(now.seconds * 90_000) + 4_500 {
                 var t = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: now, decodeTimeStamp: .invalid)
                 var early: CMSampleBuffer?
                 CMSampleBufferCreateReadyWithImageBuffer(allocator: nil, imageBuffer: pb, formatDescription: fmt,
                                                          sampleTiming: &t, sampleBufferOut: &early)
-                if let early { layer.sampleBufferRenderer.enqueue(early) }
+                if let early { pendingVideo.append(early) }
             }
             note("first picture on screen")
         }
-        if let sb { layer.sampleBufferRenderer.enqueue(sb) }
+        if let sb { pendingVideo.append(sb) }
         if debug, started {
-            let now = sync.currentTime()
+            let now = clockNow
             if now.isValid {
                 let lead = Double(pts - Int64(now.seconds * 90_000)) / 90
                 leadMin = min(leadMin, lead); if lead < 0 { lateFrames += 1 }; leadFrames += 1
@@ -258,7 +283,9 @@ final class Player {
     // MARK: audio
 
     func audio(stereo: UnsafePointer<Float>, frames: Int, rate: Int, pts rawPTS: Int64) {
-        lock.lock(); defer { lock.unlock() }
+        let t = sync.currentTime()
+        lock.lock(); defer { unlockAndApply() }
+        clockNow = t
         guard rawPTS != Int64.min, frames > 0 else { return }
         let pts = unwrap(rawPTS, 1)
         latestPTS = max(latestPTS, pts)
@@ -266,11 +293,11 @@ final class Player {
         checkDrift()
         // audio arriving with less than 40 ms to spare will underrun: run further behind live
         if started, latency < 90_000 {
-            let now = sync.currentTime()
+            let now = clockNow
             if now.isValid, pts - Int64(now.seconds * 90_000) < 3_600 {
                 latency = min(90_000, latency + 18_000)
                 if debug { FileHandle.standardError.write("player: audio nearly late, buffer now \(latency * 1000 / 90_000) ms\n".data(using: .utf8)!) }
-                sync.setRate(1, time: CMTime(value: pts - latency, timescale: 90_000))   // audio's own time: video runs ahead
+                pendingClock = (1, CMTime(value: pts - latency, timescale: 90_000))   // audio's own time: video runs ahead
             }
         }
         if audioFormat == nil || Int(CMAudioFormatDescriptionGetStreamBasicDescription(audioFormat!)!.pointee.mSampleRate) != rate {
@@ -296,6 +323,6 @@ final class Player {
             allocator: nil, dataBuffer: block, formatDescription: audioFormat, sampleCount: frames,
             presentationTimeStamp: CMTime(value: pts, timescale: 90_000), packetDescriptions: nil,
             sampleBufferOut: &sb)
-        if let sb { audio.enqueue(sb) }
+        if let sb { pendingAudio = sb }
     }
 }
