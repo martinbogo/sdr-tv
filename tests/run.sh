@@ -88,7 +88,7 @@ if [ -x "$OUT/library_tests" ]; then
 fi
 
 echo "player (channel switching, real time, about 9 s)"
-swiftc -O -parse-as-library -o "$OUT/player_tests" macos/Sources/Player.swift tests/PlayerTests.swift \
+swiftc -O -parse-as-library -o "$OUT/player_tests" macos/Sources/Player.swift macos/Sources/Enhance.swift tests/PlayerTests.swift \
     -framework AVFoundation -framework CoreMedia -framework CoreVideo 2>&1 | grep -E "error" && fail=1
 if [ -x "$OUT/player_tests" ]; then
     "$OUT/player_tests" | sed 's/^/  /'

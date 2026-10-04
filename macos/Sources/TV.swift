@@ -71,6 +71,7 @@ final class TV: ObservableObject {
     @Published private(set) var scanResults: [VirtualChannel] = []
     @Published private(set) var scanFinished = false
     // online listings (EPGTalk, imported XMLTV, TVmaze) for channels the broadcast leaves empty
+    @Published var enhanceSD: Bool { didSet { defaults.set(enhanceSD, forKey: "enhanceSD"); engine.player.enhancer.enabled = enhanceSD } }
     @Published var useEPGTalk: Bool { didSet { defaults.set(useEPGTalk, forKey: "useEPGTalk"); refreshOnlineGuide() } }
     @Published var useTVMaze: Bool { didSet { defaults.set(useTVMaze, forKey: "useTVMaze"); refreshOnlineGuide() } }
     @Published var guideMarket: String { didSet { defaults.set(guideMarket, forKey: "guideMarket"); refreshOnlineGuide() } }
@@ -136,6 +137,7 @@ final class TV: ObservableObject {
         defaults.register(defaults: ["amp": false, "lna": 24, "vga": 20, "autoGain": true, "volume": 0.8,
                                      "captionsOn": false, "captionLanguage": "eng", "captionScale": 1.0,
                                      "captionBackground": 0.75, "audioLanguage": "eng", "preferDescription": false])
+        enhanceSD = defaults.object(forKey: "enhanceSD") as? Bool ?? true
         useEPGTalk = defaults.object(forKey: "useEPGTalk") as? Bool ?? true
         useTVMaze = defaults.object(forKey: "useTVMaze") as? Bool ?? true
         guideMarket = defaults.string(forKey: "guideMarket") ?? ""
@@ -154,6 +156,7 @@ final class TV: ObservableObject {
         autoGain = defaults.bool(forKey: "autoGain")
         volume = defaults.double(forKey: "volume")
         engine.player.volume = Float(volume)
+        engine.player.enhancer.enabled = enhanceSD
         channels = library.visibleChannels
 
         engine.onChannels = { [weak self] list in self?.channelsReceived(list) }
@@ -1046,9 +1049,9 @@ final class TV: ObservableObject {
         if let p = dbgPrev { let dt = now.timeIntervalSince(p.0); vfps = Double(m.video_frames &- p.1) / dt; afps = Double(m.audio_frames &- p.2) / dt }
         dbgPrev = (now, m.video_frames, m.audio_frames)
         FileHandle.standardError.write(String(format: "t=%.1f fields=%llu clock=%+.2fppm pilot=%.0fdB ", now.timeIntervalSince(tunedAt), s.fields, s.clock_ppm, s.pilot_snr_db).data(using: .utf8)!)
-        FileHandle.standardError.write(String(format: "state=%d snr=%.1f dbfs=%.1f lna=%d vga=%d amp=%d loss=%.1f%% video=%.1ffps audio=%.1ffr/s overruns=%d rescue=%@ dropped=%llu relocks=%llu\n",
+        FileHandle.standardError.write(String(format: "state=%d snr=%.1f dbfs=%.1f lna=%d vga=%d amp=%d loss=%.1f%% video=%.1ffps audio=%.1ffr/s overruns=%d rescue=%@ dropped=%llu relocks=%llu enhanced=%d slow=%d\n",
             s.state.rawValue, s.snr_db, s.dbfs, lna, vga, ampOn ? 1 : 0, lossRate * 100, vfps, afps, engine.overruns,
-            rescueNote ?? "-", m.dropped_packets, s.relocks).data(using: .utf8)!)
+            rescueNote ?? "-", m.dropped_packets, s.relocks, engine.player.enhancer.enhanced, engine.player.enhancer.slow).data(using: .utf8)!)
     }
 
     /// Is the current channel failing because of the signal (as opposed to, say, a codec)?

@@ -88,6 +88,8 @@ final class Player {
     var videoFrameCounts: (total: Int, late: Int) { lock.lock(); defer { lock.unlock() }; return (framesSinceFlush, lateSinceFlush) }
     private var framesSinceFlush = 0, lateSinceFlush = 0
     private var newestPicture: CVPixelBuffer?
+    /// Super-resolution for standard definition on large screens (media thread).
+    let enhancer = SDEnhancer()
     private static let ciContext = CIContext(options: [.cacheIntermediates: false])
 
     /// A small copy (up to 960 wide, square pixels at `aspect`) of the newest picture, for showing
@@ -237,25 +239,8 @@ final class Player {
 
     func video(y: UnsafePointer<UInt8>, u: UnsafePointer<UInt8>, v: UnsafePointer<UInt8>,
                yStride: Int, uvStride: Int, width: Int, height: Int, sarNum: Int, sarDen: Int, pts rawPTS: Int64) {
-        let t = sync.currentTime()
-        lock.lock(); defer { unlockAndApply() }
-        clockNow = t
         guard rawPTS != Int64.min else { return }
-        var pts = unwrap(rawPTS, 0) + videoShift
-        if started, clockNow.isValid {
-            // video normally runs 0-2 s ahead of the clock; persistently far outside that, it has
-            // jumped: shift it back into line with the audio-driven clock (half a second ahead)
-            let lead = pts - Int64(clockNow.seconds * 90_000)
-            if lead > 6 * 90_000 { farAheadSinceFlush += 1 }
-            if lead > 6 * 90_000 || lead < -2 * 90_000 { strayRun += 1 } else { strayRun = 0 }
-            if strayRun >= 15 {
-                let fix = Int64(clockNow.seconds * 90_000) + 45_000 - pts
-                videoShift += fix; pts += fix; strayRun = 0
-                if debug { FileHandle.standardError.write("player: video timestamps jumped \(-fix / 90) ms; realigned\n".data(using: .utf8)!) }
-            }
-        }
-        latestPTS = max(latestPTS, pts)
-        startIfNeeded(pts, isAudio: false)
+        // the picture (pools and buffers belong to the media thread: no lock needed)
         if pool == nil || poolW != width || poolH != height {
             let attrs: [String: Any] = [
                 kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
@@ -265,7 +250,7 @@ final class Player {
             ]
             var p: CVPixelBufferPool?
             CVPixelBufferPoolCreate(nil, nil, attrs as CFDictionary, &p)
-            pool = p; poolW = width; poolH = height; fmtDesc = nil
+            pool = p; poolW = width; poolH = height
         }
         guard let pool else { return }
         var pbOut: CVPixelBuffer?
@@ -284,13 +269,33 @@ final class Player {
             for x in 0..<cw { d[2 * x] = su[x]; d[2 * x + 1] = sv[x] }
         }
         CVPixelBufferUnlockBaseAddress(pb, [])
+        // standard definition on a large screen: Apple's super-resolution, 2x (nil: show as is)
+        let shown = enhancer.process(pb) ?? pb
+        let t = sync.currentTime()
+        lock.lock(); defer { unlockAndApply() }
+        clockNow = t
+        var pts = unwrap(rawPTS, 0) + videoShift
+        if started, clockNow.isValid {
+            // video normally runs 0-2 s ahead of the clock; persistently far outside that, it has
+            // jumped: shift it back into line with the audio-driven clock (half a second ahead)
+            let lead = pts - Int64(clockNow.seconds * 90_000)
+            if lead > 6 * 90_000 { farAheadSinceFlush += 1 }
+            if lead > 6 * 90_000 || lead < -2 * 90_000 { strayRun += 1 } else { strayRun = 0 }
+            if strayRun >= 15 {
+                let fix = Int64(clockNow.seconds * 90_000) + 45_000 - pts
+                videoShift += fix; pts += fix; strayRun = 0
+                if debug { FileHandle.standardError.write("player: video timestamps jumped \(-fix / 90) ms; realigned\n".data(using: .utf8)!) }
+            }
+        }
+        latestPTS = max(latestPTS, pts)
+        startIfNeeded(pts, isAudio: false)
         // colour and pixel shape: BT.709 for HD, BT.601 for SD; SD pixels are not square
         let hd = height >= 720
-        CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey,
+        CVBufferSetAttachment(shown, kCVImageBufferYCbCrMatrixKey,
                               hd ? kCVImageBufferYCbCrMatrix_ITU_R_709_2 : kCVImageBufferYCbCrMatrix_ITU_R_601_4, .shouldPropagate)
-        CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey,
+        CVBufferSetAttachment(shown, kCVImageBufferColorPrimariesKey,
                               hd ? kCVImageBufferColorPrimaries_ITU_R_709_2 : kCVImageBufferColorPrimaries_SMPTE_C, .shouldPropagate)
-        CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, .shouldPropagate)
+        CVBufferSetAttachment(shown, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, .shouldPropagate)
         // display shape = frame size x pixel aspect; applied by sizing the layer, not by buffer tags
         let par = sarNum > 0 && sarDen > 0 ? CGFloat(sarNum) / CGFloat(sarDen) : 1
         let aspect = (CGFloat(width) * par / CGFloat(height) * 1000).rounded() / 1000
@@ -299,15 +304,15 @@ final class Player {
             shownAspect = aspect
             DispatchQueue.main.async { [weak self] in self?.onAspect?(aspect) }
         }
-        if fmtDesc == nil || !CMVideoFormatDescriptionMatchesImageBuffer(fmtDesc!, imageBuffer: pb) {
+        if fmtDesc == nil || !CMVideoFormatDescriptionMatchesImageBuffer(fmtDesc!, imageBuffer: shown) {
             fmtDesc = nil
-            CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: pb, formatDescriptionOut: &fmtDesc)
+            CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: shown, formatDescriptionOut: &fmtDesc)
         }
         guard let fmt = fmtDesc else { return }
         var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: CMTime(value: pts, timescale: 90_000),
                                         decodeTimeStamp: .invalid)
         var sb: CMSampleBuffer?
-        CMSampleBufferCreateReadyWithImageBuffer(allocator: nil, imageBuffer: pb, formatDescription: fmt,
+        CMSampleBufferCreateReadyWithImageBuffer(allocator: nil, imageBuffer: shown, formatDescription: fmt,
                                                  sampleTiming: &timing, sampleBufferOut: &sb)
         if !firstFrameOnScreen, let fmt = fmtDesc {
             // the first picture after a channel change goes up now, not when the clock reaches it:
@@ -317,14 +322,14 @@ final class Player {
             if started, now.isValid, pts > Int64(now.seconds * 90_000) + 4_500 {
                 var t = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: now, decodeTimeStamp: .invalid)
                 var early: CMSampleBuffer?
-                CMSampleBufferCreateReadyWithImageBuffer(allocator: nil, imageBuffer: pb, formatDescription: fmt,
+                CMSampleBufferCreateReadyWithImageBuffer(allocator: nil, imageBuffer: shown, formatDescription: fmt,
                                                          sampleTiming: &t, sampleBufferOut: &early)
                 if let early { pendingVideo.append(early) }
             }
             note("first picture on screen")
             DispatchQueue.main.async { [weak self] in self?.onFirstPicture?() }
         }
-        if let sb { pendingVideo.append(sb); newestPicture = pb }
+        if let sb { pendingVideo.append(sb); newestPicture = shown }
         if started, clockNow.isValid {
             framesSinceFlush += 1
             if pts < Int64(clockNow.seconds * 90_000) { lateSinceFlush += 1 }

@@ -60,6 +60,7 @@ final class VideoHostView: NSView {
         if h > bounds.height { h = bounds.height; w = h * aspect }
         CATransaction.begin(); CATransaction.setDisableActions(true)
         v.frame = CGRect(x: (bounds.width - w) / 2, y: (bounds.height - h) / 2, width: w, height: h)
+        TV.shared.engine.player.enhancer.displayHeight = h * (window?.backingScaleFactor ?? 2)   // on-screen pixels
         CATransaction.commit()
     }
 }
@@ -780,6 +781,15 @@ struct TunerSettings: View {
     @EnvironmentObject var tv: TV
     var body: some View {
         Form {
+            Section {
+                Toggle("Enhance standard-definition picture", isOn: $tv.enhanceSD)
+                    .disabled(!SDEnhancer.available)
+            } header: { Text("Picture") } footer: {
+                Text(SDEnhancer.available
+                     ? "480-line channels are doubled in resolution with Apple's real-time super-resolution before they are scaled to the screen: clearer edges and detail on large displays."
+                     : "Needs macOS 26 or later.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             Section {
                 Toggle("Automatic gain", isOn: $tv.autoGain)
                 gain("LNA gain", $tv.lna, 0...40, 8)
