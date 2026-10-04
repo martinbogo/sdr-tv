@@ -71,6 +71,19 @@ final class Player {
         sync.addRenderer(audio)
     }
 
+    // MARK: observation (diagnostics and tests)
+
+    /// The playback clock in 90 kHz ticks, or nil while it is not running.
+    var clockTicks: Int64? {
+        let t = sync.currentTime()
+        return t.isValid && sync.rate != 0 ? Int64(t.seconds * 90_000) : nil
+    }
+    /// How far playback runs behind live (90 kHz ticks).
+    var bufferTicks: Int64 { lock.lock(); defer { lock.unlock() }; return latency }
+    /// Video frames handed over since the last flush, and how many of them were already past due.
+    var videoFrameCounts: (total: Int, late: Int) { lock.lock(); defer { lock.unlock() }; return (framesSinceFlush, lateSinceFlush) }
+    private var framesSinceFlush = 0, lateSinceFlush = 0
+
     var volume: Float {
         get { audio.volume }
         set { audio.volume = newValue }
@@ -87,6 +100,7 @@ final class Player {
         epoch += 1
         latestPTS = 0; latestAudioPTS = 0          // stations' clocks are unrelated: nothing carries over
         latency = 36_000                           // each channel earns its own buffer
+        framesSinceFlush = 0; lateSinceFlush = 0
         pendingClock = nil; pendingVideo.removeAll(); pendingAudio = nil
         started = false
         stillShown = false
@@ -272,6 +286,10 @@ final class Player {
             note("first picture on screen")
         }
         if let sb { pendingVideo.append(sb) }
+        if started, clockNow.isValid {
+            framesSinceFlush += 1
+            if pts < Int64(clockNow.seconds * 90_000) { lateSinceFlush += 1 }
+        }
         if debug, started {
             let now = clockNow
             if now.isValid {

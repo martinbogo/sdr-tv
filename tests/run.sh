@@ -87,5 +87,13 @@ if [ -x "$OUT/library_tests" ]; then
     [ "${PIPESTATUS[0]}" -eq 0 ] || fail=1
 fi
 
+echo "player (channel switching, real time, about 9 s)"
+swiftc -O -parse-as-library -o "$OUT/player_tests" macos/Sources/Player.swift tests/PlayerTests.swift \
+    -framework AVFoundation -framework CoreMedia -framework CoreVideo 2>&1 | grep -E "error" && fail=1
+if [ -x "$OUT/player_tests" ]; then
+    "$OUT/player_tests" | sed 's/^/  /'
+    [ "${PIPESTATUS[0]}" -eq 0 ] || fail=1
+fi
+
 [ $fail -eq 0 ] && echo "All checks passed." || echo "Some checks FAILED."
 exit $fail
