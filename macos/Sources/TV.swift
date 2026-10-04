@@ -329,8 +329,22 @@ final class TV: ObservableObject {
     }
 
     /// One RF channel: gain, lock, then the virtual channel table (and a little guide data).
+    /// What one RF channel gave: its channels, the pilot strength, and whether more gain could help
+    /// (the signal arrived too low for the gain setting to reach its target level).
+    private struct ScanResult { var list: [VirtualChannel]; var pilotSNR: Double; var levelLow = false }
+
     private func scanOne(rf: Int, lockWait: Double, tableWait: Double, target: Double, allowAmp: Bool, boosted: Bool = false)
-        -> (list: [VirtualChannel], pilotSNR: Double) {
+        -> ScanResult {
+        let t0 = Date(); var marks: [(String, Date)] = []
+        func mark(_ s: String) { marks.append((s, Date())) }
+        defer {
+            if ProcessInfo.processInfo.environment["ATSC_DEBUG"] != nil {
+                var last = t0
+                let parts = marks.map { m -> String in defer { last = m.1 }; return String(format: "%@ %.2f", m.0, m.1.timeIntervalSince(last)) }
+                FileHandle.standardError.write(String(format: "scantime RF %d%@: %.2f s [%@]\n", rf, boosted ? " (boosted)" : "",
+                    Date().timeIntervalSince(t0), parts.joined(separator: ", ")).data(using: .utf8)!)
+            }
+        }
         DispatchQueue.main.sync {
             scanRF = rf
             scanFound = []
@@ -348,9 +362,11 @@ final class TV: ObservableObject {
                 Thread.sleep(forTimeInterval: 0.03); st = engine.stats()
             }
             // measured: noise alone reads 11-16 dB here, stations that lock 35 dB and up
-            if st.pilot_snr_db < 22 { return ([], st.pilot_snr_db) }
+            mark("pilot")
+            if st.pilot_snr_db < 22 { return ScanResult(list: [], pilotSNR: st.pilot_snr_db) }
         }
         let g = settleGain(target: target, allowAmp: allowAmp)
+        mark("gain")
         engine.retune()                                // reacquire at the new gain
         var locked = false
         let lockDeadline = Date().addingTimeInterval(lockWait)
@@ -359,20 +375,31 @@ final class TV: ObservableObject {
             if engine.stats().state == ATSC_LOCKED { locked = true; break }
         }
         let pilot = engine.stats().pilot_snr_db
-        guard locked else { return ([], pilot) }
+        let levelLow = g.dbfs < target - 6
+        mark("lock")
+        guard locked else { return ScanResult(list: [], pilotSNR: pilot, levelLow: levelLow) }
+        // Channel tables repeat at least every 0.4 s. If not one packet decodes cleanly within 1.2 s
+        // the signal is locked but unusable: no point waiting for tables.
         let tableDeadline = Date().addingTimeInterval(tableWait)
+        var since = Date(), s0 = engine.stats()
         var got: [VirtualChannel] = []
         while Date() < tableDeadline {
-            Thread.sleep(forTimeInterval: 0.1)
+            Thread.sleep(forTimeInterval: 0.05)
             got = DispatchQueue.main.sync { self.scanFound }
             if !got.isEmpty { break }
+            let s1 = engine.stats()
+            let now = s1.rs_good &+ s1.rs_corrected, before = s0.rs_good &+ s0.rs_corrected
+            // the receiver reacquired by itself (a lock that trained badly): its counters restarted
+            if now < before || s1.rs_bad < s0.rs_bad { s0 = s1; since = Date(); continue }
+            if Date().timeIntervalSince(since) > 1.2, now == before { break }   // nothing decodes: unusable
         }
-        if got.isEmpty { return ([], pilot) }
+        mark("tables")
+        if got.isEmpty { return ScanResult(list: [], pilotSNR: pilot, levelLow: levelLow) }
         // settled quality over one second: SNR, and packet loss summed over 0.1 s steps (the
         // receiver's counters restart whenever it reacquires, so only forward steps count)
         var sum = 0.0, good = 0.0, bad = 0.0
         var prev = engine.stats()
-        for _ in 0..<10 {
+        for _ in 0..<6 {
             Thread.sleep(forTimeInterval: 0.1)
             let st = engine.stats()
             sum += st.state == ATSC_LOCKED ? st.snr_db : 0
@@ -382,18 +409,22 @@ final class TV: ObservableObject {
             prev = st
         }
         let loss = good + bad > 0 ? bad / (good + bad) : 1
-        let snr = sum / 10
+        let snr = sum / 6
         if ProcessInfo.processInfo.environment["ATSC_DEBUG"] != nil {
             FileHandle.standardError.write(String(format: "scan RF %d: snr %.1f loss %.3f (good %.0f bad %.0f) gain %d/%d amp %d boosted %d\n",
                 rf, snr, loss, good, bad, g.lna, g.vga, g.amp ? 1 : 0, boosted ? 1 : 0).data(using: .utf8)!)
         }
         let tier = !boosted && !g.amp && snr >= 17 && loss < 0.01 ? 1 : snr >= 15 && loss < 0.05 ? 2 : 3
         // the guide only for stations that will be shown (a full one takes ~8-12 s)
-        if tier <= 2 { collectGuide(rf: rf, maxWait: 12, quietFor: 3) }
+        mark("quality")
+        // now-and-next only (the first table, ~3 hours, arrives within a few seconds); watching the
+        // station, Update Guide and the online sources fill in the rest
+        if tier <= 2 { collectGuide(rf: rf, maxWait: 4, quietFor: 1.5) }
+        mark("guide")
         let list = got.filter { $0.rf == rf }.map { c -> VirtualChannel in
             var c = c; c.signalDB = snr; c.lna = g.lna; c.vga = g.vga; c.amp = g.amp; c.tier = tier; return c
         }
-        return (list, pilot)
+        return ScanResult(list: list, pilotSNR: pilot, levelLow: levelLow)
     }
 
     /// The channels found on one RF channel were already found on another: the previous
@@ -652,12 +683,14 @@ final class TV: ObservableObject {
             for (i, rf) in rfs.enumerated() {
                 guard let self, !self.scanCancel else { break }
                 DispatchQueue.main.sync { self.scanProgress = 0.8 * Double(i) / Double(rfs.count); self.scanPhase = "" }
-                let r = self.scanOne(rf: rf, lockWait: 1.6, tableWait: 2.5, target: -18, allowAmp: false)
+                let r = self.scanOne(rf: rf, lockWait: 1.0, tableWait: 2.0, target: -18, allowAmp: false)
+                // more gain or the amplifier only help a signal that arrives too low to set the level;
+                // at a healthy level, poor quality is noise in the signal itself and a retry is wasted
                 if r.list.isEmpty {
-                    if r.pilotSNR > 28 { weak.append(rf) }         // a clear 8VSB pilot, but no lock
+                    if r.pilotSNR > 28, r.levelLow { weak.append(rf) }
                 } else if !self.isStaleDecode(r.list, found: found) {
                     found.append(contentsOf: r.list); publish()
-                    if r.list.first?.tier == 3 { weak.append(rf) } // decodes, but poorly: try a boost
+                    if r.list.first?.tier == 3, r.levelLow { weak.append(rf) }
                 }
             }
             // pass 2: weak candidates get more gain, the RF amp if still low, and longer to lock
@@ -667,9 +700,9 @@ final class TV: ObservableObject {
                     self.scanProgress = 0.8 + 0.2 * Double(i) / Double(max(weak.count, 1))
                     self.scanPhase = "Retrying weak signals"
                 }
-                var r = self.scanOne(rf: rf, lockWait: 2.5, tableWait: 3, target: -12, allowAmp: false, boosted: true)
+                var r = self.scanOne(rf: rf, lockWait: 1.5, tableWait: 2, target: -12, allowAmp: false, boosted: true)
                 if (r.list.first?.tier ?? 3) == 3, !self.scanCancel {
-                    let amp = self.scanOne(rf: rf, lockWait: 2.5, tableWait: 3, target: -12, allowAmp: true, boosted: true)
+                    let amp = self.scanOne(rf: rf, lockWait: 1.5, tableWait: 2, target: -12, allowAmp: true, boosted: true)
                     if !amp.list.isEmpty, (amp.list.first?.tier ?? 3) <= (r.list.first?.tier ?? 3) { r = amp }
                 }
                 if !r.list.isEmpty, !self.isStaleDecode(r.list, found: found) {

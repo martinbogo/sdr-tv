@@ -941,7 +941,7 @@ struct SetupSheet: View {
 
     private var subtitle: String {
         if tv.deviceError != nil { return "Waiting for the HackRF" }
-        if tv.scanning { return "Finding the TV stations your antenna receives. This takes about three minutes, including each station's program guide." }
+        if tv.scanning { return "Finding the TV stations your antenna receives. This takes about a minute." }
         if tv.scanResults.isEmpty { return "The scan found no digital TV stations." }
         return "Found \(tv.scanResults.count) channels. They are saved, so this runs only once."
     }
