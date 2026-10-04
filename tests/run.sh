@@ -81,9 +81,9 @@ if [ -f captures/ch26_20s.ts ]; then
 else skip "channel change speed" ch26_20s.ts; fi
 
 echo "channel list rules"
-swiftc -O -parse-as-library -o "$OUT/library_tests" macos/Sources/Channels.swift tests/LibraryTests.swift 2>&1 | grep -E "error" && fail=1
+swiftc -O -parse-as-library -o "$OUT/library_tests" macos/Sources/Channels.swift macos/Sources/OnlineGuide.swift tests/LibraryTests.swift 2>&1 | grep -E "error" && fail=1
 if [ -x "$OUT/library_tests" ]; then
-    SDRTV_DATA_DIR="$OUT/data" "$OUT/library_tests" | sed 's/^/  /' || fail=1
+    SDRTV_DATA_DIR="$OUT/data" "$OUT/library_tests" tests/fixtures/sample.xmltv | sed 's/^/  /' || fail=1
     [ "${PIPESTATUS[0]}" -eq 0 ] || fail=1
 fi
 

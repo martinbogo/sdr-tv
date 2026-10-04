@@ -66,6 +66,8 @@ struct VirtualChannel: Codable, Hashable, Identifiable {
     var autoHidden: Bool?
     /// The user checked a poor channel back on: keep showing it whatever its reception.
     var userKept: Bool?
+    /// The network the channel carries ("CBS", "Great American Family"): matches it to online listings.
+    var network: String?
     /// Recent reception results for the RF channel (oldest first, at most 4): scans, failed tunes,
     /// clean viewing. The bucket comes from these, so one bad moment does not hide a station.
     var tierHistory: [Int]?
@@ -131,6 +133,12 @@ struct GuideEvent: Codable, Hashable, Identifiable {
     var captionLangs: [String]?
     var audioLangs: [String]?
     var desc: String?
+    /// Where the listing came from (nil: the station's own broadcast) and its rank: lower wins.
+    /// 0 broadcast, 1 EPGTalk listing for this station, 2 imported XMLTV, 3 EPGTalk same-network
+    /// affiliate in this time zone, 4 TVmaze network schedule.
+    var source: String?
+    var priority: Int?
+    var rank: Int { priority ?? 0 }
 
     var id: String { "\(eventID)-\(Int(start.timeIntervalSince1970))" }
     var end: Date { start.addingTimeInterval(TimeInterval(duration)) }
@@ -219,7 +227,7 @@ final class Library {
         var list = channels.filter { $0.rf != rf }
         for var c in found {
             c.hidden = c.hidden || hiddenIDs.contains(c.id)
-            if let prev = byID[c.id] { c.autoHidden = prev.autoHidden; c.userKept = prev.userKept }
+            if let prev = byID[c.id] { c.autoHidden = prev.autoHidden; c.userKept = prev.userKept; c.network = c.network ?? prev.network }
             if let old {
                 c.lna = c.lna ?? old.lna; c.vga = c.vga ?? old.vga; c.amp = c.amp ?? old.amp
                 c.unavailable = c.unavailable ?? old.unavailable; c.bestSNR = c.bestSNR ?? old.bestSNR
@@ -246,6 +254,7 @@ final class Library {
                 // the user's own unchecking stands; the app's is undone by a good result (assign)
                 c.hidden = prev.hidden
                 c.autoHidden = prev.autoHidden; c.userKept = prev.userKept
+                c.network = c.network ?? prev.network
                 if c.tierHistory == nil { c.tierHistory = prev.tierHistory }
             }
             c.unavailable = nil
@@ -306,6 +315,34 @@ final class Library {
     }
 
     private var dirty = false
+
+    /// Listings from an online source or an imported file for one channel. An event only fills
+    /// time that no better-ranked listing covers; it replaces overlapping listings of its own or a
+    /// worse rank (the station's own broadcast data, rank 0, always wins).
+    func addExternal(_ events: [GuideEvent], key: String) {
+        guard !events.isEmpty else { return }
+        var list = guide[key] ?? []
+        var changed = false
+        for e in events where e.end > Date().addingTimeInterval(-6 * 3600) {
+            if list.contains(where: { $0.rank < e.rank && $0.start < e.end && e.start < $0.end }) { continue }
+            if let same = list.firstIndex(where: { $0.rank == e.rank && $0.start == e.start && $0.duration == e.duration }) {
+                if list[same] != e { list[same] = e; changed = true }
+                continue
+            }
+            list.removeAll { $0.rank >= e.rank && $0.start < e.end && e.start < $0.end }
+            list.append(e); changed = true
+        }
+        guard changed else { return }
+        list.sort { $0.start < $1.start }
+        guide[key] = list
+        dirty = true
+    }
+
+    func setNetwork(_ id: String, _ network: String?) {
+        guard let i = channels.firstIndex(where: { $0.id == id }) else { return }
+        channels[i].network = (network?.isEmpty ?? true) ? nil : network
+        save()
+    }
 
     /// A program description (Extended Text Table) for event `eventID` on guide key `key`.
     func describe(key: String, eventID: Int, text: String) {

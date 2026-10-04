@@ -493,7 +493,10 @@ struct GuideDetails: View {
                 let caps = e.captions == true ? "Captions" + ((e.captionLangs?.isEmpty ?? true) ? "" : " in " + e.captionLangs!.map(languageName).joined(separator: ", ")) : "No captions announced"
                 let audio = (e.audioLangs?.isEmpty ?? true) ? "" : "  ·  Audio in " + e.audioLangs!.map(languageName).joined(separator: ", ")
                 Text(caps + audio).font(.callout).foregroundStyle(.secondary)
-                Text(e.desc ?? "No description from the station.")
+                if let src = e.source {
+                    Text("Listing: " + src).font(.caption).foregroundStyle(.tertiary).lineLimit(2)
+                }
+                Text(e.desc ?? (e.source == nil ? "No description from the station." : "No description."))
                     .font(.callout).foregroundStyle(e.desc == nil ? .tertiary : .primary)
                     .lineLimit(3).fixedSize(horizontal: false, vertical: true)
             } else {
@@ -566,7 +569,8 @@ struct GuideRow: View {
         if tv.guideRefreshing { return "Waiting for this station's guide…" }
         // read recently, and still nothing: the station is not sending listings for it
         if let t = tv.library.guideUpdated[ch.rf], Date().timeIntervalSince(t) < 6 * 3600 {
-            return "The station is not sending listings for this channel"
+            return (tv.useEPGTalk || tv.useTVMaze || !tv.xmltvImports.isEmpty)
+                ? "No listings from the station or the online sources" : "The station is not sending listings for this channel"
         }
         return "No guide information yet. Press U to update"
     }
@@ -622,10 +626,83 @@ struct SettingsView: View {
         TabView {
             TunerSettings().tabItem { Label("Tuner", systemImage: "antenna.radiowaves.left.and.right") }
             ChannelSettings().tabItem { Label("Channels", systemImage: "list.number") }
+            GuideSettings().tabItem { Label("Guide", systemImage: "calendar") }
             AccessibilitySettings().tabItem { Label("Captions & Audio", systemImage: "captions.bubble") }
             RecordingSettings().tabItem { Label("Recording", systemImage: "record.circle") }
         }
-        .frame(width: 520, height: 460)
+        .frame(width: 640, height: 520)
+    }
+}
+
+/// Where listings come from when a station does not send its own.
+struct GuideSettings: View {
+    @EnvironmentObject var tv: TV
+    @State private var newURL = ""
+
+    var body: some View {
+        Form {
+            Section {
+                Text("Each station's own broadcast guide always comes first. These sources fill in what a station leaves empty, in this order.")
+                    .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            Section("EPGTalk (primary online source)") {
+                Toggle("Use EPGTalk listings", isOn: $tv.useEPGTalk)
+                Picker("Local market", selection: $tv.guideMarket) {
+                    Text(tv.onlineReport.detectedMarket.isEmpty ? "Detect automatically" : "Detect automatically (\(tv.onlineReport.detectedMarket))").tag("")
+                    ForEach(tv.onlineReport.markets, id: \.self) { Text($0).tag($0) }
+                }
+                .disabled(!tv.useEPGTalk)
+                Text("Local stations, multicast networks such as Great American Family and Grit (from their national schedules), and network programs from a same-network station in your time zone where yours is not listed.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Link("epgtalk.com", destination: URL(string: "https://epgtalk.com")!).font(.caption)
+            }
+            Section("Imported XMLTV listings") {
+                ForEach(tv.xmltvImports, id: \.self) { src in
+                    HStack {
+                        Text(src).lineLimit(1).truncationMode(.middle)
+                        Spacer()
+                        Button(role: .destructive) { tv.xmltvImports.removeAll { $0 == src } } label: { Image(systemName: "minus.circle") }
+                            .buttonStyle(.borderless).help("Stop using this file")
+                    }
+                }
+                HStack {
+                    TextField("XMLTV URL", text: $newURL).textFieldStyle(.roundedBorder)
+                    Button("Add URL") {
+                        let u = newURL.trimmingCharacters(in: .whitespaces)
+                        if u.hasPrefix("http"), !tv.xmltvImports.contains(u) { tv.xmltvImports.append(u) }
+                        newURL = ""
+                    }
+                    .disabled(!newURL.hasPrefix("http"))
+                    Button("Add File…") {
+                        let panel = NSOpenPanel()
+                        panel.allowedContentTypes = [.xml, .data]
+                        panel.allowsMultipleSelection = false
+                        if panel.runModal() == .OK, let p = panel.url?.path, !tv.xmltvImports.contains(p) { tv.xmltvImports.append(p) }
+                    }
+                }
+                Text("Matched to channels by number (\"6.1\") or name. Ranked after EPGTalk.").font(.caption).foregroundStyle(.secondary)
+            }
+            Section("TVmaze") {
+                Toggle("Use TVmaze network schedules", isOn: $tv.useTVMaze)
+                Text("Network programs (CBS, NBC, ABC, FOX, PBS, The CW) at their usual local times, for channels nothing else covers. Set each channel's network in Channels. Data from TVmaze.com, licensed CC BY-SA.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Link("tvmaze.com", destination: URL(string: "https://www.tvmaze.com")!).font(.caption)
+            }
+            Section {
+                HStack {
+                    Button(tv.onlineRefreshing ? "Updating…" : "Update Online Listings Now") { tv.refreshOnlineGuide(force: true) }
+                        .disabled(tv.onlineRefreshing)
+                    if tv.onlineRefreshing { ProgressView().controlSize(.small) }
+                    Spacer()
+                    if let t = tv.onlineUpdatedAt { Text("Updated \(t.formatted(date: .omitted, time: .shortened))").foregroundStyle(.secondary) }
+                }
+                if !tv.onlineReport.matched.isEmpty {
+                    Text("\(tv.onlineReport.matched.count) channels have online listings").font(.callout)
+                }
+                ForEach(tv.onlineReport.lines, id: \.self) { Text($0).font(.caption).foregroundStyle(.secondary) }
+            }
+        }
+        .formStyle(.grouped)
     }
 }
 
@@ -693,6 +770,21 @@ struct ChannelSettings: View {
                 TableColumn("Channel") { ch in Text(ch.number).monospacedDigit() }.width(64)
                 TableColumn("Name", value: \.name)
                 TableColumn("RF") { ch in Text("\(ch.rf)").monospacedDigit() }.width(36)
+                TableColumn("Network") { ch in
+                    Picker("", selection: Binding(get: { ch.network ?? "" }, set: { tv.setNetwork(ch, $0.isEmpty ? nil : $0) })) {
+                        Text("None").tag("")
+                        Section("Broadcast networks") { ForEach(OnlineGuide.affiliateNetworks, id: \.self) { Text($0).tag($0) } }
+                        Section("Multicast networks") {
+                            ForEach(Array(Set(OnlineGuide.multicast.map(\.network))).sorted(), id: \.self) { Text($0).tag($0) }
+                        }
+                        if let n = ch.network, !OnlineGuide.affiliateNetworks.contains(n), !OnlineGuide.multicast.contains(where: { $0.network == n }) {
+                            Text(n).tag(n)
+                        }
+                    }
+                    .labelsHidden()
+                    .help("Matches the channel to online listings when the station does not send its own")
+                }
+                .width(150)
                 TableColumn("Reception") { ch in
                     Text(ch.tierLabel)
                         .foregroundStyle(ch.tier == 3 ? AnyShapeStyle(.orange) : ch.tier == nil ? AnyShapeStyle(.tertiary) : AnyShapeStyle(.primary))

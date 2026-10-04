@@ -77,6 +77,44 @@ struct LibraryTests {
         lib.record(rf: 26, 3)
         check(lib.channels.first { $0.id == "8.1" }?.hidden == true, "a second failure hides it")
 
+        print("online listings rank below the broadcast")
+        let t0 = Date().addingTimeInterval(3600)
+        func ev(_ min: Double, _ dur: Int, _ title: String, rank: Int?) -> GuideEvent {
+            var e = GuideEvent(eventID: Int(min) + 100_000, start: t0.addingTimeInterval(min * 60), duration: dur * 60, title: title)
+            e.priority = rank; e.source = rank == nil ? nil : "test \(rank!)"; return e
+        }
+        lib.add(event: ev(0, 30, "Broadcast", rank: nil), key: "x")
+        lib.addExternal([ev(0, 30, "Online A", rank: 1), ev(30, 30, "Online B", rank: 1)], key: "x")
+        var xs = lib.events("x", from: t0, to: t0.addingTimeInterval(7200)).map(\.title)
+        check(xs == ["Broadcast", "Online B"], "online fills only the gap the broadcast leaves (\(xs))")
+        lib.addExternal([ev(30, 30, "TVmaze B", rank: 4)], key: "x")
+        xs = lib.events("x", from: t0, to: t0.addingTimeInterval(7200)).map(\.title)
+        check(xs == ["Broadcast", "Online B"], "a lower-ranked source does not replace a better one")
+        lib.addExternal([ev(60, 30, "TVmaze C", rank: 4)], key: "x")
+        lib.addExternal([ev(60, 30, "EPGTalk C", rank: 1)], key: "x")
+        xs = lib.events("x", from: t0, to: t0.addingTimeInterval(7200)).map(\.title)
+        check(xs.last == "EPGTalk C", "a better-ranked source replaces a worse one")
+        lib.add(event: ev(30, 30, "Broadcast B", rank: nil), key: "x")
+        xs = lib.events("x", from: t0, to: t0.addingTimeInterval(7200)).map(\.title)
+        check(xs == ["Broadcast", "Broadcast B", "EPGTalk C"], "the station's own listing replaces online ones when it arrives")
+
+        print("XMLTV import")
+        var report = OnlineGuide.Report()
+        let fixture = URL(fileURLWithPath: CommandLine.arguments[1])
+        if let feed = OnlineGuide.loadFeed(fixture, maxAge: 0, report: &report) {
+            check(feed.channels.count == 2 && feed.programmes["a"]?.count == 2, "channels and programs parsed")
+            let e = OnlineGuide.events(feed.programmes["a"] ?? [], source: "t", priority: 2).first
+            check(e?.title == "Evening Show" && e?.desc == "Pilot. A test program." && e?.rating == "TV-PG" && e?.captions == true,
+                  "title, episode, description, rating and captions")
+            check(OnlineGuide.markets(in: feed) == ["Testville"], "market from the channel name")
+            var koin = ch(25, 6, 1); koin.network = "CBS"
+            check(OnlineGuide.exactChannel(feed, market: "Testville", ch: koin) == "a", "matched by number, market and network")
+            koin.network = "NBC"
+            check(OnlineGuide.exactChannel(feed, market: "Testville", ch: koin) == nil, "a different network is not matched")
+            var great = ch(25, 6, 2); great.name = "GREAT"
+            check(OnlineGuide.guessNetwork(great) == "Great American Family", "multicast network from the short name")
+        } else { check(false, "fixture parsed") }
+
         print(failures == 0 ? "library: all passed" : "library: \(failures) failed")
         exit(failures == 0 ? 0 : 1)
     }

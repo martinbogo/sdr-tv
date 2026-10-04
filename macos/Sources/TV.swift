@@ -63,6 +63,14 @@ final class TV: ObservableObject {
     @Published private(set) var scanPhase = ""
     @Published private(set) var scanResults: [VirtualChannel] = []
     @Published private(set) var scanFinished = false
+    // online listings (EPGTalk, imported XMLTV, TVmaze) for channels the broadcast leaves empty
+    @Published var useEPGTalk: Bool { didSet { defaults.set(useEPGTalk, forKey: "useEPGTalk"); refreshOnlineGuide() } }
+    @Published var useTVMaze: Bool { didSet { defaults.set(useTVMaze, forKey: "useTVMaze"); refreshOnlineGuide() } }
+    @Published var guideMarket: String { didSet { defaults.set(guideMarket, forKey: "guideMarket"); refreshOnlineGuide() } }
+    @Published var xmltvImports: [String] { didSet { defaults.set(xmltvImports, forKey: "xmltvImports"); refreshOnlineGuide(force: true) } }
+    @Published private(set) var onlineReport = OnlineGuide.Report()
+    @Published private(set) var onlineRefreshing = false
+    @Published private(set) var onlineUpdatedAt: Date?
     @Published private(set) var guideRefreshing = false
     @Published private(set) var guideRefreshProgress = 0.0
     @Published private(set) var guideRefreshNote = ""
@@ -114,6 +122,10 @@ final class TV: ObservableObject {
         defaults.register(defaults: ["amp": false, "lna": 24, "vga": 20, "autoGain": true, "volume": 0.8,
                                      "captionsOn": false, "captionLanguage": "eng", "captionScale": 1.0,
                                      "captionBackground": 0.75, "audioLanguage": "eng", "preferDescription": false])
+        useEPGTalk = defaults.object(forKey: "useEPGTalk") as? Bool ?? true
+        useTVMaze = defaults.object(forKey: "useTVMaze") as? Bool ?? true
+        guideMarket = defaults.string(forKey: "guideMarket") ?? ""
+        xmltvImports = defaults.stringArray(forKey: "xmltvImports") ?? []
         captionsOn = defaults.bool(forKey: "captionsOn")
         captionLanguage = defaults.string(forKey: "captionLanguage") ?? "eng"
         captionScale = defaults.double(forKey: "captionScale")
@@ -154,6 +166,9 @@ final class TV: ObservableObject {
         openDevice()
         Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.tick() }
         Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in self?.library.saveGuideIfNeeded() }
+        // online listings: shortly after launch (the picture comes first), then every 6 hours
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in self?.refreshOnlineGuide() }
+        Timer.scheduledTimer(withTimeInterval: 6 * 3600, repeats: true) { [weak self] _ in self?.refreshOnlineGuide() }
     }
 
     // MARK: device
@@ -451,6 +466,46 @@ final class TV: ObservableObject {
 
     func cancelGuideRefresh() { scanCancel = true }
 
+    private var onlinePending = false
+
+    /// Fetch and match online listings in the background (downloads are cached for 12 hours unless
+    /// `force`). Channels without a network setting get one guessed from their name first.
+    func refreshOnlineGuide(force: Bool = false) {
+        if onlineRefreshing { onlinePending = true; return }
+        for ch in library.channels where ch.network == nil {
+            if let n = OnlineGuide.guessNetwork(ch) { library.setNetwork(ch.id, n) }
+        }
+        let chans = library.channels
+        let settings = OnlineGuide.Settings(epgTalk: useEPGTalk, tvMaze: useTVMaze, market: guideMarket, imports: xmltvImports)
+        // the stations' own listings, by network: tells which online markets share our clock
+        var reference: [String: [(start: Date, title: String)]] = [:]
+        for ch in chans { if let n = ch.network {
+            reference[n, default: []] += library.events(ch.guideKey, from: Date().addingTimeInterval(-6 * 3600), to: Date().addingTimeInterval(3 * 86400))
+                .filter { $0.rank == 0 }.map { ($0.start, $0.title) }
+        } }
+        onlineRefreshing = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            var batches: [(String, [GuideEvent])] = []
+            let report = OnlineGuide.refresh(channels: chans, settings: settings, reference: reference, force: force) { key, events in batches.append((key, events)) }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                for (key, events) in batches { self.library.addExternal(events, key: key) }
+                self.library.saveGuideIfNeeded(force: true)
+                self.guideTick &+= 1
+                self.onlineReport = report
+                self.onlineUpdatedAt = Date()
+                self.onlineRefreshing = false
+                if self.onlinePending { self.onlinePending = false; self.refreshOnlineGuide() }
+            }
+        }
+    }
+
+    func setNetwork(_ ch: VirtualChannel, _ network: String?) {
+        library.setNetwork(ch.id, network)
+        channels = library.visibleChannels
+        refreshOnlineGuide()
+    }
+
     private var guideNotedAt: Date?
 
     /// While a channel plays, its station's whole guide streams in too; note when it is complete.
@@ -561,6 +616,7 @@ final class TV: ObservableObject {
                 }
                 self.library.save()
                 if !found.isEmpty { self.defaults.set(true, forKey: "initialScanDone") }
+                self.refreshOnlineGuide()
                 if !self.setupVisible, let first = self.lastWatched() ?? self.channels.first { self.current = nil; self.tune(first) }
             }
         }

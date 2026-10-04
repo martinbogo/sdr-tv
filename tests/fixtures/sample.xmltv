@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<tv>
+  <channel id="a"><display-name>CBS Testville</display-name><display-name>6.1 CBS Testville</display-name><display-name>6.1</display-name></channel>
+  <channel id="b"><display-name>Great American Family</display-name><display-name>326</display-name></channel>
+  <programme start="20300101180000 +0000" stop="20300101183000 +0000" channel="a">
+    <title lang="en">Evening Show</title><sub-title lang="en">Pilot</sub-title><desc lang="en">A test program.</desc>
+    <rating system="VCHIP"><value>TV-PG</value></rating><subtitles type="teletext" />
+  </programme>
+  <programme start="20300101183000 +0000" stop="20300101190000 +0000" channel="a"><title>Late Show</title></programme>
+  <programme start="20300101180000 +0000" stop="20300101200000 +0000" channel="b"><title>A Movie</title></programme>
+</tv>
