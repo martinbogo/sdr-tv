@@ -3,6 +3,28 @@ import SwiftUI
 
 // MARK: - video surface
 
+/// The channel's last-seen picture, dimmed, while the live picture is on its way.
+struct LastSeenStill: View {
+    let still: Snapshots.Still
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            Image(decorative: still.image, scale: 1)
+                .resizable()
+                .aspectRatio(still.aspect, contentMode: .fit)
+                .saturation(0.7)
+                .overlay(Color.black.opacity(0.32))         // dimmed: recognizable, clearly not live
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            Text("Last seen \(still.taken.formatted(.relative(presentation: .named))) · tuning…")
+                .font(.callout.weight(.semibold)).foregroundStyle(.white)
+                .padding(.horizontal, 12).padding(.vertical, 6)
+                .background(.black.opacity(0.6), in: Capsule())
+                .padding(24)
+        }
+        .transition(.opacity)
+        .allowsHitTesting(false)
+    }
+}
+
 struct VideoSurface: NSViewRepresentable {
     let layer: AVSampleBufferDisplayLayer
     let aspect: CGFloat
@@ -51,8 +73,9 @@ struct TVScreen: View {
     var body: some View {
         ZStack {
             Color.black
+            if let still = tv.still, !tv.hasPicture, !tv.liveShown, !tv.scanning, !tv.setupVisible { LastSeenStill(still: still) }
             VideoSurface(layer: tv.engine.player.layer, aspect: tv.aspect)
-                .opacity(tv.hasPicture && !tv.scanning && !tv.setupVisible ? 1 : 0)
+                .opacity((tv.hasPicture || tv.liveShown) && !tv.scanning && !tv.setupVisible ? 1 : 0)
             if tv.hasPicture, tv.captionService != 0, !tv.guideVisible { CaptionOverlay() }
             idleMessage
             VStack(spacing: 0) {
@@ -108,7 +131,8 @@ struct TVScreen: View {
             .foregroundStyle(.white.opacity(0.85))
         } else if tv.guideRefreshing {
             if !tv.guideVisible { GuideRefreshOSD() }
-        } else if !tv.hasPicture, !tv.scanning, !tv.setupVisible, !tv.rechecking, tv.current != nil {
+        } else if !tv.hasPicture, !tv.liveShown, !tv.scanning, !tv.setupVisible, !tv.rechecking, tv.current != nil,
+                  tv.still == nil || tv.secondsSinceTune > 3 {
             TuningOSD()
         }
     }

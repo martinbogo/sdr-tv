@@ -42,6 +42,13 @@ final class TV: ObservableObject {
     @Published private(set) var current: VirtualChannel?
     private var previous: VirtualChannel?
     @Published private(set) var aspect: CGFloat = 16.0 / 9.0   // picture display aspect
+    /// The channel's last-seen picture, shown dimmed until live video arrives.
+    @Published private(set) var still: Snapshots.Still?
+    /// The live picture is on screen since the last channel change (set the moment the player shows
+    /// its first frame, ahead of the half-second status check).
+    @Published private(set) var liveShown = false
+    private let snapshots = Snapshots()
+    private var snapshotTicks = 0
     @Published private(set) var format = ""          // "1080i", "720p", "480i"
     @Published private(set) var audioLayout = ""     // "5.1", "Stereo"
     @Published private(set) var stats = atsc_stats()
@@ -102,6 +109,7 @@ final class TV: ObservableObject {
     @Published private(set) var rescueNote: String?  // what the automatic rescue is trying
     private var tunedAt = Date()
     private var lastFrameAt: Date?
+    var secondsSinceTune: Double { Date().timeIntervalSince(tunedAt) }
     private var lastVideoFrames: UInt64 = 0
     private var rsHist: [(good: UInt64, bad: UInt64)] = []
     private var rescue: Rescue?
@@ -168,6 +176,7 @@ final class TV: ObservableObject {
         }
         engine.onClock = { [weak self] d in self?.broadcastClock = d }
         engine.player.onAspect = { [weak self] a in self?.aspect = a }
+        engine.player.onFirstPicture = { [weak self] in self?.liveShown = true; self?.still = nil }
         engine.player.onCaption = { [weak self] json in self?.showCaptions(json) }
         engine.onProgramInfo = { [weak self] info in self?.programInfo(info) }
 
@@ -216,8 +225,21 @@ final class TV: ObservableObject {
 
     // MARK: tuning
 
+    /// Keep the current picture as the channel's last-seen still.
+    private func captureStill() {
+        guard let cur = current, hasPicture else { return }
+        let a = aspect, id = cur.id, player = engine.player
+        DispatchQueue.global(qos: .utility).async { [weak self] in   // image work off the main thread
+            guard let img = player.snapshot(aspect: a) else { return }
+            DispatchQueue.main.async { self?.snapshots.store(img, aspect: a, for: id) }
+        }
+    }
+
     func tune(_ ch: VirtualChannel, showBanner: Bool = true) {
         guard deviceError == nil else { return }
+        if current?.id != ch.id { captureStill() }
+        liveShown = false
+        still = current?.id == ch.id && hasPicture ? nil : snapshots.still(for: ch.id)
         if ch.isUnavailable { flash("\(ch.number) \(ch.name) was too weak last time. Trying again…", seconds: 4) }
         if let cur = current, cur.id != ch.id { previous = cur }
         if engine.currentRF != ch.rf || current == nil {
@@ -464,7 +486,7 @@ final class TV: ObservableObject {
         if let r = back?.rf, let i = rfs.firstIndex(of: r) { rfs.remove(at: i); rfs.append(r) }
         guard !rfs.isEmpty else { return }
         guideRefreshing = true; guideRefreshProgress = 0; scanCancel = false
-        hasPicture = false; captionRegions = []
+        hasPicture = false; liveShown = false; captionRegions = []
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             for (i, rf) in rfs.enumerated() {
                 guard let self, !self.scanCancel else { break }
@@ -965,6 +987,11 @@ final class TV: ObservableObject {
         // after a dropout the last good frame is held until a clean keyframe (up to ~3 s): keep it up
         let picture = lastFrameAt.map { Date().timeIntervalSince($0) < 3.5 } ?? false
         hasPicture = s.state == ATSC_LOCKED && picture && !format.isEmpty
+        if hasPicture, still != nil { still = nil }
+        if liveShown, !hasPicture, (lastFrameAt.map { Date().timeIntervalSince($0) > 3.5 } ?? (secondsSinceTune > 4)) { liveShown = false }
+        // refresh the last-seen picture every 10 s of clean viewing
+        snapshotTicks += 1
+        if hasPicture, lossRate < 0.01, snapshotTicks % 20 == 0 { captureStill() }
         if s.state == ATSC_LOCKED { if lockedAt == nil { lockedAt = Date() } } else if !scanning { lockedAt = nil }
         // packet loss over the last ~2 s
         rsHist.append((s.rs_good + s.rs_corrected, s.rs_bad))

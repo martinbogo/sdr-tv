@@ -1,5 +1,6 @@
 import AVFoundation
 import CoreMedia
+import CoreImage
 import CoreVideo
 
 /// Presents decoded frames and audio with correct timing. Video goes to an
@@ -25,6 +26,9 @@ final class Player {
     /// Display aspect ratio (width / height) of the picture, reported once it has been stable
     /// for ~15 frames so a stray frame cannot make the picture jump. Called on the main thread.
     var onAspect: ((CGFloat) -> Void)?
+
+    /// The first picture after a channel change is on screen (main thread).
+    var onFirstPicture: (() -> Void)?
 
     /// Caption screens (JSON) queued with their video time; shown when playback reaches them.
     var onCaption: ((String) -> Void)?
@@ -83,6 +87,19 @@ final class Player {
     /// Video frames handed over since the last flush, and how many of them were already past due.
     var videoFrameCounts: (total: Int, late: Int) { lock.lock(); defer { lock.unlock() }; return (framesSinceFlush, lateSinceFlush) }
     private var framesSinceFlush = 0, lateSinceFlush = 0
+    private var newestPicture: CVPixelBuffer?
+    private static let ciContext = CIContext(options: [.cacheIntermediates: false])
+
+    /// A small copy (up to 960 wide, square pixels at `aspect`) of the newest picture, for showing
+    /// dimmed while the channel is tuned next time.
+    func snapshot(aspect: CGFloat) -> CGImage? {
+        lock.lock(); let pb = newestPicture; lock.unlock()
+        guard let pb else { return nil }
+        let img = CIImage(cvPixelBuffer: pb)
+        let w = min(960, CGFloat(CVPixelBufferGetWidth(pb) * 2)), h = (w / max(aspect, 0.5)).rounded()
+        let scaled = img.transformed(by: CGAffineTransform(scaleX: w / img.extent.width, y: h / img.extent.height))
+        return Self.ciContext.createCGImage(scaled, from: CGRect(x: 0, y: 0, width: w, height: h))
+    }
     /// Video frames that were far ahead of the clock (would sit off screen) since the last flush.
     var farAheadFrames: Int { lock.lock(); defer { lock.unlock() }; return farAheadSinceFlush }
     private var farAheadSinceFlush = 0
@@ -108,6 +125,7 @@ final class Player {
         latestPTS = 0; latestAudioPTS = 0          // stations' clocks are unrelated: nothing carries over
         latency = 36_000                           // each channel earns its own buffer
         framesSinceFlush = 0; lateSinceFlush = 0; farAheadSinceFlush = 0
+        newestPicture = nil
         videoShift = 0; strayRun = 0
         pendingClock = nil; pendingVideo.removeAll(); pendingAudio = nil
         started = false
@@ -304,8 +322,9 @@ final class Player {
                 if let early { pendingVideo.append(early) }
             }
             note("first picture on screen")
+            DispatchQueue.main.async { [weak self] in self?.onFirstPicture?() }
         }
-        if let sb { pendingVideo.append(sb) }
+        if let sb { pendingVideo.append(sb); newestPicture = pb }
         if started, clockNow.isValid {
             framesSinceFlush += 1
             if pts < Int64(clockNow.seconds * 90_000) { lateSinceFlush += 1 }
