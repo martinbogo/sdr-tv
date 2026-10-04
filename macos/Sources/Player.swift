@@ -16,6 +16,7 @@ final class Player {
     private var lastRaw: [Int64?] = [nil, nil]
     private var wrapBase: [Int64] = [0, 0]
     private var latestPTS: Int64 = 0
+    private var latestAudioPTS: Int64 = 0
     private var pool: CVPixelBufferPool?
     private var poolW = 0, poolH = 0
     private var audioFormat: CMAudioFormatDescription?
@@ -52,8 +53,8 @@ final class Player {
         let c = pendingClock, v = pendingVideo, a = pendingAudio, e = epoch
         pendingClock = nil; pendingVideo.removeAll(); pendingAudio = nil
         lock.unlock()
+        guard e == epoch else { return }             // a channel change came in between: drop all of it
         if let c { sync.setRate(c.rate, time: c.time) }
-        guard e == epoch else { return }             // a channel change came in between: drop old samples
         for sb in v { layer.sampleBufferRenderer.enqueue(sb) }
         if let a { audio.enqueue(a) }
     }
@@ -84,6 +85,8 @@ final class Player {
     func flush() {
         lock.lock()
         epoch += 1
+        latestPTS = 0; latestAudioPTS = 0          // stations' clocks are unrelated: nothing carries over
+        latency = 36_000                           // each channel earns its own buffer
         pendingClock = nil; pendingVideo.removeAll(); pendingAudio = nil
         started = false
         stillShown = false
@@ -139,12 +142,15 @@ final class Player {
 
     /// Keeps the audio device clock and the broadcast clock from drifting apart over hours.
     private func checkDrift() {
-        guard started else { return }
+        guard started, pendingClock == nil else { return }   // the clock is being set right now
         let now = clockNow
         guard now.isValid else { return }
-        let lead = latestPTS - Int64(now.seconds * 90_000)
+        // audio's own timeline: video is sent up to ~1.5 s ahead of its time and must not pull the clock
+        guard latestAudioPTS > 0 else { return }
+        let lead = latestAudioPTS - Int64(now.seconds * 90_000)
         if lead > 4 * 90_000 || lead < -90_000 {
-            pendingClock = (1, CMTime(value: latestPTS - latency, timescale: 90_000))
+            pendingClock = (1, CMTime(value: latestAudioPTS - latency, timescale: 90_000))
+            if debug { FileHandle.standardError.write("player: clock re-anchored to audio (was \(lead / 90) ms off)\n".data(using: .utf8)!) }
         }
     }
 
@@ -289,6 +295,7 @@ final class Player {
         guard rawPTS != Int64.min, frames > 0 else { return }
         let pts = unwrap(rawPTS, 1)
         latestPTS = max(latestPTS, pts)
+        latestAudioPTS = pts
         startIfNeeded(pts, isAudio: true)
         checkDrift()
         // audio arriving with less than 40 ms to spare will underrun: run further behind live
