@@ -83,6 +83,13 @@ final class Player {
     /// Video frames handed over since the last flush, and how many of them were already past due.
     var videoFrameCounts: (total: Int, late: Int) { lock.lock(); defer { lock.unlock() }; return (framesSinceFlush, lateSinceFlush) }
     private var framesSinceFlush = 0, lateSinceFlush = 0
+    /// Video frames that were far ahead of the clock (would sit off screen) since the last flush.
+    var farAheadFrames: Int { lock.lock(); defer { lock.unlock() }; return farAheadSinceFlush }
+    private var farAheadSinceFlush = 0
+    // Video timestamps can jump on their own (an inserted ad restarts the encoder's clock). The clock
+    // follows audio, so such frames would never come due: the picture freezes while sound plays on.
+    private var videoShift: Int64 = 0              // added to video timestamps after such a jump
+    private var strayRun = 0                       // consecutive video frames far from the clock
 
     var volume: Float {
         get { audio.volume }
@@ -100,7 +107,8 @@ final class Player {
         epoch += 1
         latestPTS = 0; latestAudioPTS = 0          // stations' clocks are unrelated: nothing carries over
         latency = 36_000                           // each channel earns its own buffer
-        framesSinceFlush = 0; lateSinceFlush = 0
+        framesSinceFlush = 0; lateSinceFlush = 0; farAheadSinceFlush = 0
+        videoShift = 0; strayRun = 0
         pendingClock = nil; pendingVideo.removeAll(); pendingAudio = nil
         started = false
         stillShown = false
@@ -215,7 +223,19 @@ final class Player {
         lock.lock(); defer { unlockAndApply() }
         clockNow = t
         guard rawPTS != Int64.min else { return }
-        let pts = unwrap(rawPTS, 0)
+        var pts = unwrap(rawPTS, 0) + videoShift
+        if started, clockNow.isValid {
+            // video normally runs 0-2 s ahead of the clock; persistently far outside that, it has
+            // jumped: shift it back into line with the audio-driven clock (half a second ahead)
+            let lead = pts - Int64(clockNow.seconds * 90_000)
+            if lead > 6 * 90_000 { farAheadSinceFlush += 1 }
+            if lead > 6 * 90_000 || lead < -2 * 90_000 { strayRun += 1 } else { strayRun = 0 }
+            if strayRun >= 15 {
+                let fix = Int64(clockNow.seconds * 90_000) + 45_000 - pts
+                videoShift += fix; pts += fix; strayRun = 0
+                if debug { FileHandle.standardError.write("player: video timestamps jumped \(-fix / 90) ms; realigned\n".data(using: .utf8)!) }
+            }
+        }
         latestPTS = max(latestPTS, pts)
         startIfNeeded(pts, isAudio: false)
         if pool == nil || poolW != width || poolH != height {

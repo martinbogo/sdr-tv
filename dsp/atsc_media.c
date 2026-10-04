@@ -69,7 +69,8 @@ struct atsc_media {
     // dropouts: continuity counters of the decoded streams, and what a gap does to the output
     int v_cc, a_cc;                       // last continuity counter seen (-1: none yet)
     int v_wait_key;                       // a gap hit the video: hold the picture until a clean keyframe
-    int64_t v_wait_from;                  // pts of the first frame held back
+    int64_t v_wait_from;                  // (unused: timestamps can jump at splices; frames are counted)
+    int v_held_run;                       // frames held back in a row
     int a_skip;                           // audio frames still to drop after a gap
     uint64_t v_held, gaps;                // frames held back, gaps seen (diagnostics)
     // instant subchannel switching: every program's video since its last keyframe, as TS packets
@@ -416,7 +417,7 @@ static void close_decoders(atsc_media *m) {
     m->vpes.started = m->apes.started = 0; m->vpes.len = m->apes.len = 0;
     m->fmt_w = m->fmt_h = m->fmt_ach = -1;
     m->a_next_pts = m->v_next_pts = AV_NOPTS_VALUE; m->v_frame_dur = 0;
-    m->v_cc = m->a_cc = -1; m->v_wait_key = 1; m->v_wait_from = AV_NOPTS_VALUE; m->a_skip = 0;
+    m->v_cc = m->a_cc = -1; m->v_wait_key = 1; m->v_wait_from = AV_NOPTS_VALUE; m->a_skip = 0; m->v_held_run = 0;
 }
 
 static enum AVCodecID video_codec(int t) {
@@ -578,13 +579,13 @@ static void decode_video(atsc_media *m, AVPacket *pk) {
         int damaged = (f->flags & AV_FRAME_FLAG_CORRUPT) || f->decode_error_flags;
         if (vdebug()) fprintf(stderr, "vframe pts %.3f type %c key %d corrupt %d err %d wait %d\n", f->pts / 90000.0,
             av_get_picture_type_char(f->pict_type), !!(f->flags & AV_FRAME_FLAG_KEY), !!(f->flags & AV_FRAME_FLAG_CORRUPT), f->decode_error_flags, m->v_wait_key);
-        if (m->v_wait_key) {
-            int key = (f->flags & AV_FRAME_FLAG_KEY) || f->pict_type == AV_PICTURE_TYPE_I;
-            if (m->v_wait_from == AV_NOPTS_VALUE) m->v_wait_from = f->pts;
-            int waited_long = f->pts != AV_NOPTS_VALUE && m->v_wait_from != AV_NOPTS_VALUE && f->pts - m->v_wait_from > 3 * 90000;
-            if ((key && !damaged) || (waited_long && !damaged)) { m->v_wait_key = 0; m->v_wait_from = AV_NOPTS_VALUE; }
-            else { m->v_held++; av_frame_unref(f); continue; }
-        } else if (damaged) { m->v_held++; av_frame_unref(f); continue; }
+        // Never hold for long: after ~3 s of frames (counted, since timestamps can jump at ad
+        // splices) the picture comes back even if the decoder still flags it, rather than freezing.
+        int key = (f->flags & AV_FRAME_FLAG_KEY) || f->pict_type == AV_PICTURE_TYPE_I;
+        int give_up = m->v_held_run >= 90;
+        if (m->v_wait_key && !(key && !damaged) && !give_up) { m->v_held++; m->v_held_run++; av_frame_unref(f); continue; }
+        if (!m->v_wait_key && damaged && !give_up) { m->v_held++; m->v_held_run++; av_frame_unref(f); continue; }
+        m->v_wait_key = 0; m->v_held_run = 0;
         AVRational sar = f->sample_aspect_ratio.num ? f->sample_aspect_ratio : (AVRational){1, 1};
         if (!m->graph || f->width != m->g_w || f->height != m->g_h || f->format != m->g_fmt ||
             sar.num != m->g_sn || sar.den != m->g_sd) {
