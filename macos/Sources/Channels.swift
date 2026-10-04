@@ -411,5 +411,20 @@ struct CaptionRegion: Decodable, Hashable {
     var y: Double
     var anchor: Int
     var grid: Int?                 // 1 for CEA-608 rows (32 x 15 grid)
-    var lines: [String]
+    var lines: [String]            // plain text (also read by VoiceOver)
+    var runs: [[CaptionRun]]?      // the same lines as styled runs
+    var justify: Int?              // 708: 0 left, 1 right, 2 centre, 3 full
+    var fill: String?              // 708 window fill colour "#RRGGBB" and opacity
+    var fo: Double?
+}
+
+/// A run of caption text in one style (colours "#RRGGBB", opacities 0...1; see dsp/atsc_captions.c).
+struct CaptionRun: Decodable, Hashable {
+    var t: String
+    var fg: String, fo: Double
+    var bg: String, bo: Double
+    var i: Int, u: Int
+    var f: Int                     // 708 font style: 0 default, 1 mono serif, 2 serif, 3 mono sans, 4 sans, 5 casual, 6 cursive, 7 small caps
+    var s: Int                     // pen size: 0 small, 1 standard, 2 large
+    var e: Int                     // edge: 0 none, 1 raised, 2 depressed, 3 uniform (outline), 4/5 drop shadow
 }

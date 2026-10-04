@@ -80,6 +80,10 @@ if [ -f captures/ch26_20s.ts ]; then
     if [ "${cold:-99999}" -le 2500 ]; then pass "cold start: first picture after ${cold} ms of stream"; else bad "cold start: ${cold:-none} ms (max 2500)"; fi
 else skip "channel change speed" ch26_20s.ts; fi
 
+echo "captions"
+clang -O2 -Idsp -o "$OUT/test_captions" dsp/test_captions.c dsp/atsc_captions.c || fail=1
+"$OUT/test_captions" | sed 's/^/  /'; [ "${PIPESTATUS[0]}" -eq 0 ] || fail=1
+
 echo "channel list rules"
 swiftc -O -parse-as-library -o "$OUT/library_tests" macos/Sources/Channels.swift macos/Sources/OnlineGuide.swift macos/Sources/Recordings.swift tests/LibraryTests.swift 2>&1 | grep -E "error" && fail=1
 if [ -x "$OUT/library_tests" ]; then

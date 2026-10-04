@@ -1123,17 +1123,12 @@ struct CaptionOverlay: View {
                 ForEach(Array(tv.captionRegions.enumerated()), id: \.offset) { _, r in
                     Color.clear.frame(width: 0, height: 0)
                         .overlay(alignment: alignment(r.anchor)) {
-                            VStack(alignment: hAlign(r.anchor), spacing: 0) {
-                                ForEach(Array(r.lines.enumerated()), id: \.offset) { _, line in
-                                    Text(line.isEmpty ? " " : line)
-                                        .font(.system(size: fs, weight: .medium, design: .monospaced))
-                                        .foregroundStyle(.white)
-                                        .padding(.horizontal, fs * 0.25)
-                                        .frame(minHeight: row * tv.captionScale)
-                                        .background(Color.black.opacity(line.trimmingCharacters(in: .whitespaces).isEmpty ? 0 : tv.captionBackground))
-                                        .fixedSize()
+                            VStack(alignment: hAlign(r), spacing: 0) {
+                                ForEach(Array(r.lines.enumerated()), id: \.offset) { k, line in
+                                    lineView(line, runs: r.runs.flatMap { k < $0.count ? $0[k] : nil }, fs: fs, row: row)
                                 }
                             }
+                            .background(windowFill(r))
                         }
                         .position(x: safe.minX + CGFloat(r.x) * safe.width, y: safe.minY + CGFloat(r.y) * safe.height)
                 }
@@ -1142,6 +1137,80 @@ struct CaptionOverlay: View {
         .allowsHitTesting(false)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(tv.captionRegions.flatMap(\.lines).joined(separator: " "))
+    }
+
+    /// One caption line: the broadcaster's styled runs, or the viewer's own style.
+    @ViewBuilder private func lineView(_ line: String, runs: [CaptionRun]?, fs: CGFloat, row: CGFloat) -> some View {
+        let blank = line.trimmingCharacters(in: .whitespaces).isEmpty
+        let edge = tv.captionCustom ? tv.captionEdge : (runs?.first(where: { !$0.t.trimmingCharacters(in: .whitespaces).isEmpty })?.e ?? 0)
+        let text = Text(attributed(line, runs: runs, fs: fs))
+            .padding(.horizontal, fs * 0.25)
+            .frame(minHeight: row * tv.captionScale)
+            .background(lineBackground(blank: blank, runs: runs))
+            .fixedSize()
+        edged(text, edge: edge, fs: fs)
+    }
+
+    private func attributed(_ line: String, runs: [CaptionRun]?, fs: CGFloat) -> AttributedString {
+        let custom = tv.captionCustom
+        guard let runs, !runs.isEmpty else {
+            var a = AttributedString(line.isEmpty ? " " : line)
+            a.font = font(custom ? tv.captionFont : 0, size: fs, italic: false)
+            a.foregroundColor = custom ? Color(hex: tv.captionTextColor) : .white
+            return a
+        }
+        var out = AttributedString()
+        for r in runs {
+            var a = AttributedString(r.t)
+            let scale: CGFloat = custom ? 1 : [0.8, 1, 1.2][min(max(r.s, 0), 2)]
+            a.font = font(custom ? tv.captionFont : r.f, size: fs * scale, italic: r.i == 1)
+            a.foregroundColor = custom ? Color(hex: tv.captionTextColor) : Color(hex: r.fg).opacity(r.fo)
+            if r.u == 1 { a.underlineStyle = .single }
+            // the broadcaster's character backgrounds; the viewer's style draws one per line instead
+            if !custom, r.bo > 0, !r.t.trimmingCharacters(in: .whitespaces).isEmpty { a.backgroundColor = Color(hex: r.bg).opacity(r.bo) }
+            out += a
+        }
+        return out
+    }
+
+    private func lineBackground(blank: Bool, runs: [CaptionRun]?) -> Color {
+        if blank { return .clear }
+        if tv.captionCustom || runs == nil { return Color(hex: tv.captionCustom ? tv.captionBackColor : "#000000").opacity(tv.captionBackground) }
+        return .clear                                   // styled runs carry their own backgrounds
+    }
+
+    private func windowFill(_ r: CaptionRegion) -> Color {
+        guard !tv.captionCustom, let f = r.fill, let o = r.fo, o > 0, r.runs != nil else { return .clear }
+        return Color(hex: f).opacity(o)
+    }
+
+    /// 708 font styles (also the viewer's choices): default, monospaced serif, serif, monospaced sans,
+    /// sans serif, casual, cursive, small capitals.
+    private func font(_ style: Int, size: CGFloat, italic: Bool) -> Font {
+        var f: Font
+        switch style {
+        case 1: f = .custom("Courier New", size: size).weight(.semibold)
+        case 2: f = .system(size: size, weight: .medium, design: .serif)
+        case 4: f = .system(size: size, weight: .medium, design: .default)
+        case 5: f = .system(size: size, weight: .semibold, design: .rounded)
+        case 6: f = .custom("Snell Roundhand", size: size * 1.15).weight(.bold)
+        case 7: f = .system(size: size, weight: .medium, design: .default).smallCaps()
+        default: f = .system(size: size, weight: .medium, design: .monospaced)
+        }
+        return italic ? f.italic() : f
+    }
+
+    /// Character edges: raised, depressed, uniform outline, drop shadow.
+    @ViewBuilder private func edged<V: View>(_ v: V, edge: Int, fs: CGFloat) -> some View {
+        let d = max(1, fs / 18)
+        switch edge {
+        case 1: v.shadow(color: .white.opacity(0.6), radius: 0, x: -d, y: -d).shadow(color: .black, radius: 0, x: d, y: d)
+        case 2: v.shadow(color: .black, radius: 0, x: -d, y: -d).shadow(color: .white.opacity(0.6), radius: 0, x: d, y: d)
+        case 3: v.shadow(color: .black, radius: 0, x: d, y: 0).shadow(color: .black, radius: 0, x: -d, y: 0)
+                 .shadow(color: .black, radius: 0, x: 0, y: d).shadow(color: .black, radius: 0, x: 0, y: -d)
+        case 4, 5: v.shadow(color: .black.opacity(0.9), radius: d / 2, x: d * 1.5, y: d * 1.5)
+        default: v
+        }
     }
 
     private func pictureRect(_ size: CGSize) -> CGRect {
@@ -1154,13 +1223,19 @@ struct CaptionOverlay: View {
         [.topLeading, .top, .topTrailing, .leading, .center, .trailing, .bottomLeading, .bottom, .bottomTrailing][min(max(a, 0), 8)]
     }
 
-    private func hAlign(_ a: Int) -> HorizontalAlignment {
-        switch a % 3 { case 1: return .center; case 2: return .trailing; default: return .leading }
+    private func hAlign(_ r: CaptionRegion) -> HorizontalAlignment {
+        switch r.justify { case 1: return .trailing; case 2: return .center; default: break }
+        switch r.anchor % 3 { case 1: return .center; case 2: return .trailing; default: return .leading }
     }
 }
 
 struct AccessibilitySettings: View {
     @EnvironmentObject var tv: TV
+    /// The eight caption colors of the CEA standards.
+    @ViewBuilder private var colourOptions: some View {
+        Text("White").tag("#FFFFFF"); Text("Yellow").tag("#FFFF00"); Text("Green").tag("#00FF00"); Text("Cyan").tag("#00FFFF")
+        Text("Blue").tag("#0000FF"); Text("Magenta").tag("#FF00FF"); Text("Red").tag("#FF0000"); Text("Black").tag("#000000")
+    }
     private let languages = ["eng", "spa", "fra", "por", "deu", "ita", "zho", "kor", "vie", "tgl", "rus", "ara", "jpn"]
 
     var body: some View {
@@ -1173,13 +1248,30 @@ struct AccessibilitySettings: View {
                 Picker("Text size", selection: $tv.captionScale) {
                     Text("Small").tag(0.8); Text("Medium").tag(1.0); Text("Large").tag(1.3); Text("Extra large").tag(1.6)
                 }
-                LabeledContent("Background") {
+                Picker("Style", selection: $tv.captionCustom) {
+                    Text("As the broadcaster sends it").tag(false)
+                    Text("My own").tag(true)
+                }
+                if tv.captionCustom {
+                    Picker("Text color", selection: $tv.captionTextColor) { colourOptions }
+                    Picker("Background color", selection: $tv.captionBackColor) { colourOptions }
+                    Picker("Font", selection: $tv.captionFont) {
+                        Text("Monospaced").tag(0); Text("Monospaced serif").tag(1); Text("Serif").tag(2)
+                        Text("Sans serif").tag(4); Text("Casual").tag(5); Text("Cursive").tag(6); Text("Small capitals").tag(7)
+                    }
+                    Picker("Character edges", selection: $tv.captionEdge) {
+                        Text("None").tag(0); Text("Outline").tag(3); Text("Drop shadow").tag(4); Text("Raised").tag(1); Text("Depressed").tag(2)
+                    }
+                }
+                LabeledContent("Background opacity") {
                     Slider(value: $tv.captionBackground, in: 0...1)
                 }
+                .disabled(!tv.captionCustom)
+                .help(tv.captionCustom ? "" : "The broadcaster's style sets its own backgrounds; choose My own to set this")
             } header: {
                 Text("Closed captions")
             } footer: {
-                Text("Digital (CEA-708) captions are used when the station provides them in your language, otherwise analog-compatible (CEA-608) captions. Press C to switch captions while watching.")
+                Text("Digital (CEA-708) captions are used when the station provides them in your language, otherwise analog-compatible (CEA-608) captions. The broadcaster's style shows its colors, fonts and placement; My own replaces them with yours (italics and underlining are kept, since they carry meaning). Press C to switch captions while watching.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
@@ -1195,5 +1287,13 @@ struct AccessibilitySettings: View {
             }
         }
         .formStyle(.grouped)
+    }
+}
+
+extension Color {
+    /// "#RRGGBB"
+    init(hex: String) {
+        let v = UInt32(hex.trimmingCharacters(in: CharacterSet(charactersIn: "#")), radix: 16) ?? 0xFFFFFF
+        self.init(red: Double(v >> 16 & 0xFF) / 255, green: Double(v >> 8 & 0xFF) / 255, blue: Double(v & 0xFF) / 255)
     }
 }

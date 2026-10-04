@@ -21,6 +21,12 @@ final class TV: ObservableObject {
     @Published var captionLanguage: String { didSet { defaults.set(captionLanguage, forKey: "captionLanguage"); applyCaptionChoice() } }
     @Published var captionScale: Double { didSet { defaults.set(captionScale, forKey: "captionScale") } }
     @Published var captionBackground: Double { didSet { defaults.set(captionBackground, forKey: "captionBackground") } }
+    // caption appearance: the broadcaster's styling, or the viewer's own (US rules require the choice)
+    @Published var captionCustom: Bool { didSet { defaults.set(captionCustom, forKey: "captionCustom") } }
+    @Published var captionTextColor: String { didSet { defaults.set(captionTextColor, forKey: "captionTextColor") } }
+    @Published var captionBackColor: String { didSet { defaults.set(captionBackColor, forKey: "captionBackColor") } }
+    @Published var captionFont: Int { didSet { defaults.set(captionFont, forKey: "captionFont") } }
+    @Published var captionEdge: Int { didSet { defaults.set(captionEdge, forKey: "captionEdge") } }
     @Published var audioLanguage: String { didSet { defaults.set(audioLanguage, forKey: "audioLanguage") } }
     @Published var preferDescription: Bool { didSet { defaults.set(preferDescription, forKey: "preferDescription") } }
     @Published private(set) var audioTracks: [Engine.AudioTrack] = []
@@ -155,6 +161,11 @@ final class TV: ObservableObject {
         captionLanguage = defaults.string(forKey: "captionLanguage") ?? "eng"
         captionScale = defaults.double(forKey: "captionScale")
         captionBackground = defaults.double(forKey: "captionBackground")
+        captionCustom = defaults.bool(forKey: "captionCustom")
+        captionTextColor = defaults.string(forKey: "captionTextColor") ?? "#FFFFFF"
+        captionBackColor = defaults.string(forKey: "captionBackColor") ?? "#000000"
+        captionFont = defaults.integer(forKey: "captionFont")
+        captionEdge = defaults.integer(forKey: "captionEdge")
         audioLanguage = defaults.string(forKey: "audioLanguage") ?? "eng"
         preferDescription = defaults.bool(forKey: "preferDescription")
         ampOn = defaults.bool(forKey: "amp")

@@ -30,6 +30,53 @@ static void sb_json_text(sbuf *s, const uint32_t *cps, int n) {
     sb_str(s, "\"");
 }
 
+// Character style, packed: bits 0-5 text colour (2 bits each R,G,B), 6-7 text opacity (0 solid,
+// 1 flash, 2 translucent, 3 transparent), 8-13 background colour, 14-15 background opacity,
+// 16 italic, 17 underline, 18-20 font style (708), 21-22 pen size (0 small, 1 standard, 2 large),
+// 23-25 edge type (0 none, 1 raised, 2 depressed, 3 uniform, 4 left shadow, 5 right shadow).
+#define A_FG(a) ((a) & 0x3F)
+#define A_FO(a) (((a) >> 6) & 3)
+#define A_BG(a) (((a) >> 8) & 0x3F)
+#define A_BO(a) (((a) >> 14) & 3)
+#define A_IT(a) (((a) >> 16) & 1)
+#define A_UL(a) (((a) >> 17) & 1)
+#define A_FONT(a) (((a) >> 18) & 7)
+#define A_SIZE(a) (((a) >> 21) & 3)
+#define A_EDGE(a) (((a) >> 23) & 7)
+#define A_MAKE(fg, fo, bg, bo, it, ul, font, size, edge) \
+    ((uint32_t)(fg) | (uint32_t)(fo) << 6 | (uint32_t)(bg) << 8 | (uint32_t)(bo) << 14 | (uint32_t)(it) << 16 | \
+     (uint32_t)(ul) << 17 | (uint32_t)(font) << 18 | (uint32_t)(size) << 21 | (uint32_t)(edge) << 23)
+#define A_DEFAULT A_MAKE(0x3F, 0, 0, 0, 0, 0, 0, 1, 0)   // white on solid black, standard size
+
+static void sb_color(sbuf *s, const char *key, int c6) {
+    static const int lv[4] = {0, 85, 170, 255};
+    char t[24];
+    snprintf(t, sizeof t, ",\"%s\":\"#%02X%02X%02X\"", key, lv[(c6 >> 4) & 3], lv[(c6 >> 2) & 3], lv[c6 & 3]);
+    sb_str(s, t);
+}
+
+/// One line as styled runs: [{"t":"text","fg":"#FFFFFF","fo":1,"bg":"#000000","bo":1,"i":1,...}, ...]
+static void sb_runs(sbuf *s, const uint32_t *cps, const uint32_t *attrs, int n) {
+    static const double op[4] = {1, 1, 0.5, 0};
+    sb_str(s, "[");
+    int k = 0, first = 1;
+    while (k < n) {
+        int e = k;
+        while (e < n && attrs[e] == attrs[k]) e++;
+        uint32_t a = attrs[k];
+        if (!first) sb_str(s, ",");
+        sb_str(s, "{\"t\":");
+        sb_json_text(s, cps + k, e - k);
+        sb_color(s, "fg", A_FG(a)); sb_color(s, "bg", A_BG(a));
+        char t[96];
+        snprintf(t, sizeof t, ",\"fo\":%.1f,\"bo\":%.1f,\"i\":%d,\"u\":%d,\"f\":%d,\"s\":%d,\"e\":%d}",
+                 op[A_FO(a)], op[A_BO(a)], A_IT(a), A_UL(a), A_FONT(a), A_SIZE(a), A_EDGE(a));
+        sb_str(s, t);
+        first = 0; k = e;
+    }
+    sb_str(s, "]");
+}
+
 // ----------------------------------------------------------------------------- CEA-608
 
 #define R608 15
@@ -37,7 +84,7 @@ static void sb_json_text(sbuf *s, const uint32_t *cps, int n) {
 
 typedef struct {
     uint32_t ch[R608][C608];          // 0 = empty cell
-    uint8_t italic[R608][C608];
+    uint32_t attr[R608][C608];        // style of each cell
 } screen608;
 
 typedef struct {
@@ -45,7 +92,7 @@ typedef struct {
     int mode;                         // 0 pop-on, 1 roll-up, 2 paint-on
     int rollup_rows;
     int row, col;                     // cursor
-    int italic;
+    int italic, underline, fg;        // current pen: 608 colours as 6-bit RGB
     uint8_t last_b1, last_b2;         // for dropping repeated control codes
     int active;                       // this data channel is the selected one
     int cur_channel;                  // data channel of the last control code (1 or 2)
@@ -70,11 +117,19 @@ static const int pac_row[8] = {10, 0, 2, 11, 13, 4, 6, 8};
 
 static screen608 *target608(dec608 *d) { return d->mode == 0 ? &d->nondisp : &d->disp; }
 
+/// PAC / mid-row style: white, green, blue, cyan, red, yellow, magenta, or white italics.
+static void set608colour(dec608 *d, int code) {
+    static const int col[7] = {0x3F, 0x0C, 0x03, 0x0F, 0x30, 0x3C, 0x33};
+    int k = (code & 0x0E) >> 1;
+    if (k == 7) { d->italic = 1; return; }       // italics keep the colour
+    d->italic = 0; d->fg = col[k];
+}
+
 static void put608(dec608 *d, uint32_t c) {
     if (d->col >= C608) d->col = C608 - 1;
     screen608 *s = target608(d);
     s->ch[d->row][d->col] = c;
-    s->italic[d->row][d->col] = (uint8_t)d->italic;
+    s->attr[d->row][d->col] = A_MAKE(d->fg ? d->fg : 0x3F, 0, 0, 0, d->italic, d->underline, 0, 1, 0);
     if (d->col < C608 - 1) d->col++;
 }
 
@@ -86,7 +141,7 @@ static void rollup608(dec608 *d) {
     }
     for (int r = top; r < base; r++) {
         memcpy(d->disp.ch[r], d->disp.ch[r + 1], sizeof d->disp.ch[r]);
-        memcpy(d->disp.italic[r], d->disp.italic[r + 1], sizeof d->disp.italic[r]);
+        memcpy(d->disp.attr[r], d->disp.attr[r + 1], sizeof d->disp.attr[r]);
     }
     memset(d->disp.ch[base], 0, sizeof d->disp.ch[base]);
     d->col = 0;
@@ -135,18 +190,19 @@ static int pair608(dec608 *d, int b1, int b2) {
                 screen608 t; memset(&t, 0, sizeof t);
                 for (int rr = 0; rr < R608; rr++) {
                     int nr = rr + shift;
-                    if (nr >= 0 && nr < R608) { memcpy(t.ch[nr], d->disp.ch[rr], sizeof t.ch[nr]); memcpy(t.italic[nr], d->disp.italic[rr], sizeof t.italic[nr]); }
+                    if (nr >= 0 && nr < R608) { memcpy(t.ch[nr], d->disp.ch[rr], sizeof t.ch[nr]); memcpy(t.attr[nr], d->disp.attr[rr], sizeof t.attr[nr]); }
                 }
                 d->disp = t;
             }
             d->row = r;
             int low = b2 & 0x1F;
-            if (low >= 0x10) { d->col = ((low & 0x0E) >> 1) * 4; d->italic = 0; }
-            else { d->col = 0; d->italic = (low & 0x0E) == 0x0E; }
+            d->underline = b2 & 1;
+            if (low >= 0x10) { d->col = ((low & 0x0E) >> 1) * 4; d->italic = 0; d->fg = 0x3F; }
+            else { d->col = 0; set608colour(d, low); }
             return 0;
         }
         if (n1 == 0x11 && b2 >= 0x20 && b2 <= 0x2F) {  // mid-row: attribute change, shown as a space
-            d->italic = (b2 & 0x0E) == 0x0E; put608(d, ' ');
+            d->underline = b2 & 1; set608colour(d, b2 & 0x0F); put608(d, ' ');
             return d->mode != 0;
         }
         if (n1 == 0x11 && b2 >= 0x30 && b2 <= 0x3F) { put608(d, special608[b2 - 0x30]); return d->mode != 0; }
@@ -180,6 +236,9 @@ typedef struct {
     int rel, av, ah, anchor, rows, cols;
     int prow, pcol;
     uint32_t text[MAXR708][MAXC708];
+    uint32_t attr[MAXR708][MAXC708];
+    uint32_t pen;                     // current pen style (A_ packing)
+    int fill, fill_op, justify;       // window fill colour/opacity (SWA), 0 left 1 right 2 centre 3 full
 } win708;
 
 typedef struct {
@@ -188,14 +247,14 @@ typedef struct {
     uint8_t pkt[130]; int pkt_len, pkt_need;
 } dec708;
 
-static void clear_win(win708 *w) { memset(w->text, 0, sizeof w->text); w->prow = w->pcol = 0; }
+static void clear_win(win708 *w) { memset(w->text, 0, sizeof w->text); memset(w->attr, 0, sizeof w->attr); w->prow = w->pcol = 0; }
 
 static void put708(win708 *w, uint32_t c) {
     if (!w->defined) return;
     if (w->pcol >= w->cols) {
         if (w->pcol >= MAXC708) return;
     }
-    if (w->prow < MAXR708 && w->pcol < MAXC708) w->text[w->prow][w->pcol] = c;
+    if (w->prow < MAXR708 && w->pcol < MAXC708) { w->text[w->prow][w->pcol] = c; w->attr[w->prow][w->pcol] = w->pen ? w->pen : A_DEFAULT; }
     w->pcol++;
 }
 
@@ -272,15 +331,31 @@ static int service708(dec708 *d, const uint8_t *p, int n) {
         if (c == 0x8D) { i += 1; continue; }                                     // DLY (not modelled)
         if (c == 0x8E) continue;                                                 // DLC
         if (c == 0x8F) { memset(d->w, 0, sizeof d->w); d->cur = 0; changed = 1; continue; }   // RST
-        if (c == 0x90) { i += 2; continue; }                                     // SPA
-        if (c == 0x91) { i += 3; continue; }                                     // SPC
+        if (c == 0x90) {                                                         // SPA: pen attributes
+            if (i + 2 > n) break;
+            uint32_t pen = w->pen ? w->pen : A_DEFAULT;
+            int size = p[i] & 3, font = p[i + 1] & 7, edge = (p[i + 1] >> 3) & 7, ul = (p[i + 1] >> 6) & 1, it = (p[i + 1] >> 7) & 1;
+            w->pen = A_MAKE(A_FG(pen), A_FO(pen), A_BG(pen), A_BO(pen), it, ul, font, size > 2 ? 1 : size, edge);
+            i += 2; continue;
+        }
+        if (c == 0x91) {                                                         // SPC: pen colours
+            if (i + 3 > n) break;
+            uint32_t pen = w->pen ? w->pen : A_DEFAULT;
+            w->pen = A_MAKE(p[i] & 0x3F, p[i] >> 6, p[i + 1] & 0x3F, p[i + 1] >> 6, A_IT(pen), A_UL(pen), A_FONT(pen), A_SIZE(pen), A_EDGE(pen));
+            i += 3; continue;
+        }
         if (c == 0x92) {                                                         // SPL
             if (i + 2 > n) break;
             w->prow = p[i] & 0x0F; w->pcol = p[i + 1] & 0x3F;
             if (w->prow >= MAXR708) w->prow = MAXR708 - 1;
             i += 2; continue;
         }
-        if (c == 0x97) { i += 4; continue; }                                     // SWA
+        if (c == 0x97) {                                                         // SWA: window fill, justification
+            if (i + 4 > n) break;
+            w->fill = p[i] & 0x3F; w->fill_op = p[i] >> 6;
+            w->justify = p[i + 2] & 3;
+            i += 4; changed |= w->visible; continue;
+        }
         if (c >= 0x98) {                                                         // DFx define window
             if (i + 6 > n) break;
             win708 *x = &d->w[c - 0x98];
@@ -295,7 +370,11 @@ static int service708(dec708 *d, const uint8_t *p, int n) {
             x->rows = (p[i + 3] & 0x0F) + 1;
             x->cols = (p[i + 4] & 0x3F) + 1;
             if (x->rows > MAXR708) x->rows = MAXR708;
-            if (!was) clear_win(x);
+            int wstyle = p[i + 5] >> 3 & 7, pstyle = p[i + 5] & 7;
+            if (!was) { clear_win(x); x->pen = A_DEFAULT; x->fill = 0; x->fill_op = 0; x->justify = 0; }  // preset styles: solid black fill
+            if (wstyle == 2 || wstyle == 5) x->fill_op = 3;            // the transparent window styles
+            if (wstyle == 3 || wstyle == 6) x->justify = 2;            // centred styles
+            if (pstyle == 6 || pstyle == 7) x->pen = A_MAKE(0x3F, 0, 0, 3, 0, 0, pstyle == 6 ? 3 : 4, 1, 3);  // outlined, no background
             d->cur = c - 0x98;
             i += 6;
             changed = 1;
@@ -329,13 +408,18 @@ static void emit608(cc_decoder *cd) {
         int c0 = -1, c1 = -1;
         for (int c = 0; c < C608; c++) if (cd->d608.disp.ch[r][c] && cd->d608.disp.ch[r][c] != ' ') { if (c0 < 0) c0 = c; c1 = c; }
         if (c0 < 0) continue;
-        uint32_t line[C608]; int n = 0;
-        for (int c = c0; c <= c1; c++) line[n++] = cd->d608.disp.ch[r][c] ? cd->d608.disp.ch[r][c] : ' ';
+        uint32_t line[C608], at[C608]; int n = 0;
+        for (int c = c0; c <= c1; c++) {
+            line[n] = cd->d608.disp.ch[r][c] ? cd->d608.disp.ch[r][c] : ' ';
+            at[n++] = cd->d608.disp.attr[r][c] ? cd->d608.disp.attr[r][c] : A_DEFAULT;
+        }
         char head[96];
         snprintf(head, sizeof head, "%s{\"x\":%.4f,\"y\":%.4f,\"anchor\":0,\"grid\":1,\"lines\":[", first ? "" : ",",
                  c0 / (double)C608, r / (double)R608);
         sb_str(&s, head);
         sb_json_text(&s, line, n);
+        sb_str(&s, "],\"runs\":[");
+        sb_runs(&s, line, at, n);
         sb_str(&s, "]}");
         first = 0;
     }
@@ -358,18 +442,26 @@ static void emit708(cc_decoder *cd) {
             double y = w->rel ? w->av / 99.0 : w->av / 74.0;
             if (x > 1) x = 1; if (y > 1) y = 1;
             char head[128];
-            snprintf(head, sizeof head, "%s{\"x\":%.4f,\"y\":%.4f,\"anchor\":%d,\"lines\":[", first ? "" : ",", x, y, w->anchor > 8 ? 0 : w->anchor);
+            static const double op[4] = {1, 1, 0.5, 0};
+            snprintf(head, sizeof head, "%s{\"x\":%.4f,\"y\":%.4f,\"anchor\":%d,\"justify\":%d,\"fo\":%.1f", first ? "" : ",",
+                     x, y, w->anchor > 8 ? 0 : w->anchor, w->justify, op[w->fill_op & 3]);
             sb_str(&s, head);
-            int fl = 1;
+            sb_color(&s, "fill", w->fill);
+            sb_str(&s, ",\"lines\":[");
+            uint32_t line[MAXR708][MAXC708], at[MAXR708][MAXC708]; int len[MAXR708];
             for (int r = 0; r < w->rows; r++) {
                 int c1 = -1;
                 for (int c = 0; c < MAXC708; c++) if (w->text[r][c] && w->text[r][c] != ' ') c1 = c;
-                uint32_t line[MAXC708]; int n = 0;
-                for (int c = 0; c <= c1; c++) line[n++] = w->text[r][c] ? w->text[r][c] : ' ';
-                if (!fl) sb_str(&s, ",");
-                sb_json_text(&s, line, n);
-                fl = 0;
+                len[r] = 0;
+                for (int c = 0; c <= c1; c++) {
+                    line[r][len[r]] = w->text[r][c] ? w->text[r][c] : ' ';
+                    at[r][len[r]++] = w->attr[r][c] ? w->attr[r][c] : (w->pen ? w->pen : A_DEFAULT);
+                }
+                if (r) sb_str(&s, ",");
+                sb_json_text(&s, line[r], len[r]);
             }
+            sb_str(&s, "],\"runs\":[");
+            for (int r = 0; r < w->rows; r++) { if (r) sb_str(&s, ","); sb_runs(&s, line[r], at[r], len[r]); }
             sb_str(&s, "]}");
             first = 0;
         }

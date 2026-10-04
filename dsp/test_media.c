@@ -72,15 +72,21 @@ static void on_time(void *c, int64_t utc) {
     (void)c; static int once;
     if (!once++) { time_t t = utc; printf("broadcast time: %s", ctime(&t)); }
 }
+static int ncaps; static char lastcap[4096];
+static void on_caps(void *c, int64_t pts, const char *j) {
+    (void)c; (void)pts;
+    if (strstr(j, "\"t\"") && strlen(j) > strlen(lastcap) / 2) { snprintf(lastcap, sizeof lastcap, "%s", j); ncaps++; }
+}
 static void on_format(void *c, int w, int h, int il, int ach) {
     (void)c; printf("format: %dx%d %s, audio %d ch\n", w, h, il ? "interlaced" : "progressive", ach);
 }
 
 int main(int argc, char **argv) {
     outpath = argv[3];
-    atsc_media_cb cb = {0}; cb.video = on_video; cb.audio = on_audio; cb.channels = on_channels; cb.event = on_event; cb.time = on_time; cb.format = on_format; cb.description = on_desc;
+    atsc_media_cb cb = {0}; cb.video = on_video; cb.audio = on_audio; cb.channels = on_channels; cb.event = on_event; cb.time = on_time; cb.format = on_format; cb.description = on_desc; cb.captions = on_caps;
     atsc_media *m = atsc_media_create(&cb);
     atsc_media_select(m, atoi(argv[2]));
+    if (getenv("CAPTIONS")) atsc_media_select_captions(m, atoi(getenv("CAPTIONS")));
     FILE *f = fopen(argv[1], "rb");
     uint8_t pkt[188];
     struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -98,6 +104,7 @@ int main(int argc, char **argv) {
     double el = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
     printf("%ld packets, %d video frames, %.2f s of audio, %d guide events, %d descriptions, %d rated, %d captioned, decoded in %.2f s\n",
            n, frames, audio_frames / 48000.0, nevents, ndesc, nrated, ncc, el);
+    if (ncaps) printf("captions: %d screens; last: %.600s\n", ncaps, lastcap);
     atsc_media_status ms; atsc_media_get_status(m, &ms);
     printf("dropouts: %llu stream gaps, %llu damaged frames held back\n", ms.stream_gaps, ms.held_frames);
     double pps = 19392658.0 / 188 / 8;                      // packets per second of a mux
