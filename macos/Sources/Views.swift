@@ -682,6 +682,7 @@ struct GuideSettings: View {
                 }
                 Text("Matched to channels by number (\"6.1\") or name. Ranked after EPGTalk.").font(.caption).foregroundStyle(.secondary)
             }
+            SchedulesDirectSection()
             Section("TVmaze") {
                 Toggle("Use TVmaze network schedules", isOn: $tv.useTVMaze)
                 Text("Network programs (CBS, NBC, ABC, FOX, PBS, The CW) at their usual local times, for channels nothing else covers. Set each channel's network in Channels. Data from TVmaze.com, licensed CC BY-SA.")
@@ -703,6 +704,51 @@ struct GuideSettings: View {
             }
         }
         .formStyle(.grouped)
+    }
+}
+
+/// Optional: for people who subscribe to Schedules Direct. Collapsed unless already in use.
+struct SchedulesDirectSection: View {
+    @EnvironmentObject var tv: TV
+    @State private var open = false
+    @State private var initialized = false
+    @State private var user = ""
+    @State private var password = ""
+    @State private var zip = ""
+
+    var body: some View {
+        Section("Schedules Direct (optional, paid subscription)") {
+            Toggle("I have a Schedules Direct account", isOn: $open)
+            if open {
+                Text("Complete listings for every channel in your area. Ranked with imported XMLTV, after the broadcast and EPGTalk. Their terms allow individual use with open-source software.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                if tv.sdUser.isEmpty {
+                    TextField("Username", text: $user).textContentType(.username)
+                    SecureField("Password", text: $password).textContentType(.password)
+                    Button("Sign In") { tv.sdSignIn(user: user, password: password); password = "" }
+                        .disabled(user.isEmpty || password.isEmpty || tv.sdBusy)
+                } else {
+                    LabeledContent("Account", value: tv.sdUser)
+                    Picker("Lineup", selection: $tv.sdLineup) {
+                        Text("None").tag("")
+                        ForEach(tv.sdLineups, id: \.self) { l in Text(l.location.isEmpty ? l.name : "\(l.name), \(l.location)").tag(l.id) }
+                        if !tv.sdLineup.isEmpty, !tv.sdLineups.contains(where: { $0.id == tv.sdLineup }) { Text(tv.sdLineup).tag(tv.sdLineup) }
+                    }
+                    .onChange(of: tv.sdLineup) { _, id in
+                        if let l = tv.sdLineups.first(where: { $0.id == id }) { tv.sdUse(l) }
+                    }
+                    HStack {
+                        TextField("ZIP code", text: $zip).frame(width: 100)
+                        Button("Find Antenna Lineups") { tv.sdFindLineups(zip: zip) }.disabled(zip.count < 5 || tv.sdBusy)
+                        Spacer()
+                        Button("Sign Out") { tv.sdSignOut() }
+                    }
+                }
+                if !tv.sdStatus.isEmpty { Text(tv.sdStatus).font(.caption).foregroundStyle(.secondary) }
+                Link("schedulesdirect.org", destination: URL(string: "https://www.schedulesdirect.org")!).font(.caption)
+            }
+        }
+        .onAppear { if !initialized { initialized = true; open = !tv.sdUser.isEmpty } }   // forms re-run this on scroll
     }
 }
 

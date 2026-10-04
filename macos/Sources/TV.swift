@@ -68,6 +68,12 @@ final class TV: ObservableObject {
     @Published var useTVMaze: Bool { didSet { defaults.set(useTVMaze, forKey: "useTVMaze"); refreshOnlineGuide() } }
     @Published var guideMarket: String { didSet { defaults.set(guideMarket, forKey: "guideMarket"); refreshOnlineGuide() } }
     @Published var xmltvImports: [String] { didSet { defaults.set(xmltvImports, forKey: "xmltvImports"); refreshOnlineGuide(force: true) } }
+    // Schedules Direct (optional): username and chosen lineup in preferences, password hash in the Keychain
+    @Published private(set) var sdUser: String
+    @Published var sdLineup: String { didSet { defaults.set(sdLineup, forKey: "sdLineup") } }
+    @Published private(set) var sdStatus = ""
+    @Published private(set) var sdLineups: [SchedulesDirect.Lineup] = []
+    @Published private(set) var sdBusy = false
     @Published private(set) var onlineReport = OnlineGuide.Report()
     @Published private(set) var onlineRefreshing = false
     @Published private(set) var onlineUpdatedAt: Date?
@@ -126,6 +132,8 @@ final class TV: ObservableObject {
         useTVMaze = defaults.object(forKey: "useTVMaze") as? Bool ?? true
         guideMarket = defaults.string(forKey: "guideMarket") ?? ""
         xmltvImports = defaults.stringArray(forKey: "xmltvImports") ?? []
+        sdUser = defaults.string(forKey: "sdUser") ?? ""
+        sdLineup = defaults.string(forKey: "sdLineup") ?? ""
         captionsOn = defaults.bool(forKey: "captionsOn")
         captionLanguage = defaults.string(forKey: "captionLanguage") ?? "eng"
         captionScale = defaults.double(forKey: "captionScale")
@@ -476,7 +484,8 @@ final class TV: ObservableObject {
             if let n = OnlineGuide.guessNetwork(ch) { library.setNetwork(ch.id, n) }
         }
         let chans = library.channels
-        let settings = OnlineGuide.Settings(epgTalk: useEPGTalk, tvMaze: useTVMaze, market: guideMarket, imports: xmltvImports)
+        var settings = OnlineGuide.Settings(epgTalk: useEPGTalk, tvMaze: useTVMaze, market: guideMarket, imports: xmltvImports)
+        if !sdUser.isEmpty, let h = SchedulesDirect.loadHash(user: sdUser) { settings.sdUser = sdUser; settings.sdHash = h; settings.sdLineup = sdLineup }
         // the stations' own listings, by network: tells which online markets share our clock
         var reference: [String: [(start: Date, title: String)]] = [:]
         for ch in chans { if let n = ch.network {
@@ -498,6 +507,76 @@ final class TV: ObservableObject {
                 if self.onlinePending { self.onlinePending = false; self.refreshOnlineGuide() }
             }
         }
+    }
+
+    // MARK: Schedules Direct
+
+    /// Check the account and keep the credentials (password only as its SHA-1, in the Keychain).
+    func sdSignIn(user: String, password: String) {
+        let u = user.trimmingCharacters(in: .whitespaces), hash = SchedulesDirect.passwordHash(password)
+        sdBusy = true; sdStatus = "Signing in…"
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            do {
+                let tok = try SchedulesDirect.token(user: u, hash: hash)
+                let st = try SchedulesDirect.status(token: tok)
+                SchedulesDirect.storeHash(hash, user: u)
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.sdUser = u; self.defaults.set(u, forKey: "sdUser")
+                    self.sdLineups = st.lineups
+                    if self.sdLineup.isEmpty, let first = st.lineups.first { self.sdLineup = first.id }
+                    self.sdStatus = "Signed in" + (st.expires.isEmpty ? "" : "; subscription until \(st.expires)")
+                    self.sdBusy = false
+                    self.refreshOnlineGuide(force: true)
+                }
+            } catch {
+                DispatchQueue.main.async { self?.sdStatus = error.localizedDescription; self?.sdBusy = false }
+            }
+        }
+    }
+
+    /// Antenna lineups for a ZIP code (to add one to the account).
+    func sdFindLineups(zip: String) {
+        guard let hash = SchedulesDirect.loadHash(user: sdUser) else { return }
+        let u = sdUser
+        sdBusy = true; sdStatus = "Looking up antenna lineups…"
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            do {
+                let tok = try SchedulesDirect.token(user: u, hash: hash)
+                let found = try SchedulesDirect.antennaLineups(token: tok, zip: zip)
+                let mine = try SchedulesDirect.status(token: tok).lineups
+                DispatchQueue.main.async {
+                    self?.sdLineups = Array(Set(mine + found)).sorted { $0.id < $1.id }
+                    self?.sdStatus = found.isEmpty ? "No antenna lineups for \(zip)" : "\(found.count) antenna lineup\(found.count == 1 ? "" : "s") found"
+                    self?.sdBusy = false
+                }
+            } catch { DispatchQueue.main.async { self?.sdStatus = error.localizedDescription; self?.sdBusy = false } }
+        }
+    }
+
+    /// Use a lineup, adding it to the account if needed (Schedules Direct allows six changes a day).
+    func sdUse(_ lineup: SchedulesDirect.Lineup) {
+        guard let hash = SchedulesDirect.loadHash(user: sdUser) else { return }
+        let u = sdUser
+        sdBusy = true; sdStatus = "Adding \(lineup.name)…"
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            do {
+                let tok = try SchedulesDirect.token(user: u, hash: hash)
+                if !(try SchedulesDirect.status(token: tok).lineups.contains { $0.id == lineup.id }) {
+                    try SchedulesDirect.addLineup(token: tok, id: lineup.id)
+                }
+                DispatchQueue.main.async {
+                    self?.sdLineup = lineup.id; self?.sdStatus = "Using \(lineup.name)"; self?.sdBusy = false
+                    self?.refreshOnlineGuide(force: true)
+                }
+            } catch { DispatchQueue.main.async { self?.sdStatus = error.localizedDescription; self?.sdBusy = false } }
+        }
+    }
+
+    func sdSignOut() {
+        SchedulesDirect.forget(user: sdUser)
+        sdUser = ""; defaults.removeObject(forKey: "sdUser")
+        sdLineup = ""; sdLineups = []; sdStatus = ""
     }
 
     func setNetwork(_ ch: VirtualChannel, _ network: String?) {

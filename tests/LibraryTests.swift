@@ -115,6 +115,9 @@ struct LibraryTests {
             check(OnlineGuide.guessNetwork(great) == "Great American Family", "multicast network from the short name")
         } else { check(false, "fixture parsed") }
 
+        print("Schedules Direct")
+        check(SchedulesDirect.passwordHash("password") == "5baa61e4c9b93f3f0682250b6cf8331b7ee68fd8", "password sent as its SHA-1 hex, as the API expects")
+
         print(failures == 0 ? "library: all passed" : "library: \(failures) failed")
         exit(failures == 0 ? 0 : 1)
     }

@@ -1,4 +1,6 @@
+import CryptoKit
 import Foundation
+import Security
 
 /// Program listings from outside the broadcast, for channels whose station sends little or none:
 ///   EPGTalk (epgtalk.com) local-market and national XMLTV feeds,
@@ -11,6 +13,7 @@ final class OnlineGuide {
         var tvMaze = true
         var market = ""                       // EPGTalk local market ("" = detect)
         var imports: [String] = []            // XMLTV file paths or URLs
+        var sdUser = "", sdHash = "", sdLineup = ""   // Schedules Direct (all empty: not used)
     }
 
     /// What one refresh did, for the Settings page.
@@ -131,6 +134,24 @@ final class OnlineGuide {
                 guard let id = ids.first, let ev = feed.programmes[id], !ev.isEmpty else { continue }
                 deliver(ch.guideKey, events(ev, source: "Imported (\(url.lastPathComponent))", priority: 2))
                 report.matched[ch.id] = report.matched[ch.id] ?? "Imported (\(url.lastPathComponent))"
+            }
+        }
+
+        // Schedules Direct, if the user subscribes: exact listings by channel number
+        if !settings.sdUser.isEmpty, !settings.sdHash.isEmpty, !settings.sdLineup.isEmpty {
+            let cache = folder.appendingPathComponent("schedulesdirect.stamp")
+            let age = (try? cache.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
+                .map { Date().timeIntervalSince($0) } ?? .infinity
+            if force || age > 12 * 3600 {
+                let byKey = SchedulesDirect.listings(user: settings.sdUser, hash: settings.sdHash, lineup: settings.sdLineup,
+                                                     channels: channels, days: 7, report: &report)
+                for (key, ev) in byKey where !ev.isEmpty {
+                    deliver(key, ev)
+                    if let ch = channels.first(where: { $0.guideKey == key }) { report.matched[ch.id] = report.matched[ch.id] ?? "Schedules Direct" }
+                }
+                if !byKey.isEmpty { FileManager.default.createFile(atPath: cache.path, contents: nil) }
+            } else {
+                report.lines.append("Schedules Direct: up to date (refreshed every 12 hours)")
             }
         }
 
@@ -410,5 +431,175 @@ final class OnlineGuide {
         let n = out.values.reduce(0) { $0 + $1.count }
         report.lines.append("TVmaze: \(n) network airings for \(networks.sorted().joined(separator: ", "))")
         return out
+    }
+}
+
+// MARK: - Schedules Direct (optional; the user's own subscription)
+
+
+/// Schedules Direct JSON API (https://json.schedulesdirect.org/20141201). Listings are matched to
+/// channels by ATSC number from the user's antenna lineup. Their terms: individual use, open
+/// source software. Nothing happens unless the user signs in under Settings > Guide.
+enum SchedulesDirect {
+    static let base = "https://json.schedulesdirect.org/20141201/"
+    static let userAgent: String = {
+        let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1"
+        return "SDR TV/\(v) (macOS)"
+    }()
+
+    struct Lineup: Hashable { var id: String; var name: String; var location: String }
+
+    // credentials: the username in preferences, the SHA-1 of the password in the Keychain
+    private static let keychainService = "SDR TV Schedules Direct"
+
+    static func passwordHash(_ password: String) -> String {
+        Insecure.SHA1.hash(data: Data(password.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func storeHash(_ hash: String, user: String) {
+        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: keychainService,
+                                kSecAttrAccount as String: user]
+        SecItemDelete(q as CFDictionary)
+        var add = q; add[kSecValueData as String] = Data(hash.utf8)
+        SecItemAdd(add as CFDictionary, nil)
+    }
+
+    static func loadHash(user: String) -> String? {
+        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: keychainService,
+                                kSecAttrAccount as String: user, kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
+        var out: AnyObject?
+        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let d = out as? Data else { return nil }
+        return String(data: d, encoding: .utf8)
+    }
+
+    static func forget(user: String) {
+        SecItemDelete([kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: keychainService,
+                       kSecAttrAccount as String: user] as CFDictionary)
+    }
+
+    // HTTP
+
+    enum SDError: LocalizedError {
+        case message(String)
+        var errorDescription: String? { if case let .message(m) = self { return m }; return nil }
+    }
+
+    /// One request; JSON in and out. Synchronous: background threads only.
+    static func call(_ path: String, method: String = "GET", token: String? = nil, body: Any? = nil) throws -> Any {
+        var req = URLRequest(url: URL(string: base + path)!, timeoutInterval: 120)
+        req.httpMethod = method
+        req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        if let token { req.setValue(token, forHTTPHeaderField: "token") }
+        if let body {
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        }
+        let done = DispatchSemaphore(value: 0)
+        var data: Data?, failure: Error?
+        URLSession.shared.dataTask(with: req) { d, _, e in data = d; failure = e; done.signal() }.resume()
+        done.wait()
+        if let failure { throw failure }
+        guard let data, let json = try? JSONSerialization.jsonObject(with: data) else { throw SDError.message("No response from Schedules Direct") }
+        if let o = json as? [String: Any], let code = o["code"] as? Int, code != 0 {
+            throw SDError.message((o["message"] as? String) ?? "Schedules Direct error \(code)")
+        }
+        return json
+    }
+
+    static func token(user: String, hash: String) throws -> String {
+        let r = try call("token", method: "POST", body: ["username": user, "password": hash]) as? [String: Any]
+        guard let t = r?["token"] as? String else { throw SDError.message("Sign-in failed") }
+        return t
+    }
+
+    /// Account expiry and the lineups already on the account.
+    static func status(token: String) throws -> (expires: String, lineups: [Lineup]) {
+        let r = try call("status", token: token) as? [String: Any] ?? [:]
+        let expires = ((r["account"] as? [String: Any])?["expires"] as? String) ?? ""
+        let lineups = (r["lineups"] as? [[String: Any]] ?? []).compactMap { l -> Lineup? in
+            guard let id = l["lineup"] as? String ?? l["ID"] as? String else { return nil }
+            return Lineup(id: id, name: l["name"] as? String ?? id, location: "")
+        }
+        return (String(expires.prefix(10)), lineups)
+    }
+
+    /// Antenna lineups for a ZIP code.
+    static func antennaLineups(token: String, zip: String) throws -> [Lineup] {
+        let r = try call("headends?country=USA&postalcode=\(zip)", token: token) as? [[String: Any]] ?? []
+        return r.filter { ($0["transport"] as? String) == "Antenna" }.flatMap { h -> [Lineup] in
+            (h["lineups"] as? [[String: Any]] ?? []).compactMap { l in
+                guard let id = l["lineup"] as? String else { return nil }
+                return Lineup(id: id, name: l["name"] as? String ?? id, location: h["location"] as? String ?? "")
+            }
+        }
+    }
+
+    /// Put a lineup on the account (Schedules Direct allows six changes a day).
+    static func addLineup(token: String, id: String) throws { _ = try call("lineups/\(id)", method: "PUT", token: token) }
+
+    /// Listings for our channels: lineup map by ATSC number -> schedules -> program details.
+    static func listings(user: String, hash: String, lineup: String, channels: [VirtualChannel], days: Int,
+                         report: inout OnlineGuide.Report) -> [String: [GuideEvent]] {
+        do {
+            let tok = try token(user: user, hash: hash)
+            let lu = try call("lineups/\(lineup)", token: tok) as? [String: Any] ?? [:]
+            var stationFor: [String: String] = [:]                 // "6.1" -> stationID
+            for m in lu["map"] as? [[String: Any]] ?? [] {
+                guard let sid = m["stationID"] as? String else { continue }
+                if let maj = m["atscMajor"] as? Int, let min = m["atscMinor"] as? Int { stationFor["\(maj).\(min)"] = sid }
+                else if let ch = m["channel"] as? String { stationFor[ch.replacingOccurrences(of: "-", with: ".")] = sid }
+            }
+            let wanted = channels.compactMap { ch in stationFor[ch.number].map { (ch, $0) } }
+            guard !wanted.isEmpty else { report.lines.append("Schedules Direct: no channels of \(lineup) match ours"); return [:] }
+            let fmt = DateFormatter(); fmt.locale = Locale(identifier: "en_US_POSIX"); fmt.dateFormat = "yyyy-MM-dd"
+            fmt.timeZone = TimeZone(identifier: "UTC")
+            let dates = (0..<days).map { fmt.string(from: Date().addingTimeInterval(Double($0) * 86400)) }
+            let sids = Array(Set(wanted.map(\.1)))
+            let sched = try call("schedules", method: "POST", token: tok, body: sids.map { ["stationID": $0, "date": dates] }) as? [[String: Any]] ?? []
+            // details of every program, 5000 to a request
+            var airings: [String: [[String: Any]]] = [:]           // stationID -> airings
+            var programIDs = Set<String>()
+            for s in sched {
+                guard let sid = s["stationID"] as? String else { continue }
+                let ps = s["programs"] as? [[String: Any]] ?? []
+                airings[sid, default: []] += ps
+                ps.compactMap { $0["programID"] as? String }.forEach { programIDs.insert($0) }
+            }
+            var programs: [String: [String: Any]] = [:]
+            let ids = Array(programIDs)
+            for chunk in stride(from: 0, to: ids.count, by: 5000) {
+                let part = Array(ids[chunk..<min(chunk + 5000, ids.count)])
+                for p in try call("programs", method: "POST", token: tok, body: part) as? [[String: Any]] ?? [] {
+                    if let id = p["programID"] as? String { programs[id] = p }
+                }
+            }
+            let iso = ISO8601DateFormatter()
+            var out: [String: [GuideEvent]] = [:]
+            for (ch, sid) in wanted {
+                out[ch.guideKey] = (airings[sid] ?? []).compactMap { a in
+                    guard let pid = a["programID"] as? String, let t = (a["airDateTime"] as? String).flatMap(iso.date(from:)),
+                          let dur = a["duration"] as? Int else { return nil }
+                    let p = programs[pid] ?? [:]
+                    let title = ((p["titles"] as? [[String: Any]])?.first?["title120"] as? String) ?? "Program"
+                    var e = GuideEvent(eventID: Int(t.timeIntervalSince1970 / 60) & 0x3FFF_FFFF, start: t, duration: dur, title: title)
+                    let d = p["descriptions"] as? [String: Any]
+                    let text = ((d?["description1000"] as? [[String: Any]])?.first?["description"] as? String)
+                        ?? ((d?["description100"] as? [[String: Any]])?.first?["description"] as? String) ?? ""
+                    let ep = p["episodeTitle150"] as? String ?? ""
+                    let desc = [ep, text].filter { !$0.isEmpty }.joined(separator: ". ")
+                    e.desc = desc.isEmpty ? nil : desc
+                    e.rating = ((a["ratings"] as? [[String: Any]]) ?? (p["contentRating"] as? [[String: Any]]))?
+                        .first { ($0["body"] as? String)?.contains("USA") ?? false }?["code"] as? String
+                    if (a["audioProperties"] as? [String])?.contains("cc") == true { e.captions = true }
+                    e.source = "Schedules Direct"; e.priority = 2
+                    return e
+                }
+            }
+            report.lines.append("Schedules Direct: \(wanted.count) channels, \(programIDs.count) programs from \(lineup)")
+            return out
+        } catch {
+            report.lines.append("Schedules Direct: \(error.localizedDescription)")
+            return [:]
+        }
     }
 }
