@@ -73,6 +73,18 @@ struct PlayerTests {
             play(p, base: 90_000 * 1000, seconds: 3.0, videoJumpAt: 1.0, videoJump: -90_000 * 600)
             let f = p.videoFrameCounts
             check(f.late <= 20, "after a backwards jump: \(f.late) of \(f.total) frames late before realigning")
+            print("rapid channel changes racing the media thread")
+            var stuck = 0
+            for k in 0..<12 {
+                let base = Int64(90_000 * (2000 + k * 5000))
+                let flusher = Thread { Thread.sleep(forTimeInterval: Double(k % 4) * 0.004); p.flush() }   // the main thread changing channel
+                p.flush(); flusher.start()
+                play(p, base: base, seconds: 0.5)
+                if p.clockTicks == nil { stuck += 1 }
+            }
+            check(stuck == 0 || p.keepPlaying() != nil, "the clock keeps running after racing flushes (\(stuck) of 12 stopped)")
+            p.flush(); play(p, base: 90_000 * 77_000, seconds: 1.6)
+            clockFollows(p, base: 90_000 * 77_000, playedFor: 1.6, "after the races")
             print("timestamps wrapping past 2^33 mid-stream")
             p.flush()
             play(p, base: (1 << 33) - 90_000, seconds: 2.0)        // wraps after one second

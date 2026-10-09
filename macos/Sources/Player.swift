@@ -141,10 +141,34 @@ final class Player {
         captionQueue.removeAll()
         DispatchQueue.main.async { [weak self] in self?.onCaption?("{\"regions\":[]}") }
         pendingSince = nil
-        lock.unlock()
+        // The reset happens inside the lock: done after it, the new station's first "start the clock"
+        // could land in between and then be stopped by it, leaving the picture frozen. (Safe here:
+        // this runs on the main thread; the media thread never calls AVFoundation under the lock.)
         sync.setRate(0, time: .zero)
         layer.sampleBufferRenderer.flush(removingDisplayedImage: true, completionHandler: nil)
         audio.flush()
+        lock.unlock()
+    }
+
+    /// Safety net, called twice a second: a clock that stopped while playing, or a renderer that
+    /// failed, is restarted (from the newest audio, else video, timestamp). Returns what it did.
+    @discardableResult
+    func keepPlaying() -> String? {
+        lock.lock()
+        let playing = started, anchor = latestAudioPTS > 0 ? latestAudioPTS - latency : latestPTS - latency, e = epoch
+        lock.unlock()
+        guard playing, anchor > 0 else { return nil }
+        var fixed: String?
+        if layer.sampleBufferRenderer.status == .failed {
+            layer.sampleBufferRenderer.flush(); fixed = "video renderer had failed"
+        }
+        if audio.status == .failed { audio.flush(); fixed = (fixed.map { $0 + "; " } ?? "") + "audio renderer had failed" }
+        if sync.rate == 0 {
+            lock.lock(); let same = e == epoch; lock.unlock()
+            if same { sync.setRate(1, time: CMTime(value: anchor, timescale: 90_000)); fixed = (fixed.map { $0 + "; " } ?? "") + "clock had stopped" }
+        }
+        if let fixed, debug { FileHandle.standardError.write("player: recovered: \(fixed)\n".data(using: .utf8)!) }
+        return fixed
     }
 
     /// 33-bit PTS -> monotonic 64-bit ticks (stream 0 = video, 1 = audio).

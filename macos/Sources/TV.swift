@@ -1124,6 +1124,7 @@ final class TV: ObservableObject {
         let picture = lastFrameAt.map { Date().timeIntervalSince($0) < 3.5 } ?? false
         hasPicture = s.state == ATSC_LOCKED && picture && !format.isEmpty
         if hasPicture, still != nil { still = nil }
+        engine.player.keepPlaying()
         if liveShown, !hasPicture, (lastFrameAt.map { Date().timeIntervalSince($0) > 3.5 } ?? (secondsSinceTune > 4)) { liveShown = false }
         // refresh the last-seen picture every 10 s of clean viewing
         snapshotTicks += 1
