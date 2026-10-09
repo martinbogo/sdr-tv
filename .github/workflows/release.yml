@@ -1,0 +1,88 @@
+# Builds SDR TV and publishes a GitHub Release when a version tag is pushed:
+#   git tag v0.5 && git push origin v0.5
+# The tag must match CFBundleShortVersionString in macos/Info.plist. Versions below 1.0, and tags
+# with a suffix (v1.2-beta), are marked as pre-releases.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:          # manual run: builds and uploads the disk image, without a release
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-26         # the macOS 26 SDK is needed for the standard-definition enhancement
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select the newest Xcode
+        run: sudo xcode-select -s "$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
+
+      - name: Restore FFmpeg
+        id: ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: third_party/ffmpeg-install
+          key: ffmpeg-${{ runner.os }}-${{ hashFiles('third_party/build_ffmpeg.sh') }}
+
+      - name: Restore libusb and libhackrf
+        id: radio
+        uses: actions/cache@v4
+        with:
+          path: third_party/radio-install
+          key: radio-${{ runner.os }}-${{ hashFiles('third_party/build_radio_libs.sh') }}
+
+      - name: Build FFmpeg
+        if: steps.ffmpeg.outputs.cache-hit != 'true'
+        run: third_party/build_ffmpeg.sh
+
+      - name: Build libusb and libhackrf
+        if: steps.radio.outputs.cache-hit != 'true'
+        run: |
+          command -v cmake >/dev/null || brew install cmake
+          third_party/build_radio_libs.sh
+
+      - name: Check the version
+        id: version
+        run: |
+          VERSION=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" macos/Info.plist)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            TAG="$GITHUB_REF_NAME"
+            case "$TAG" in "v$VERSION"|"v$VERSION"-*) ;; *) echo "::error::Tag $TAG does not match version $VERSION in macos/Info.plist"; exit 1 ;; esac
+            case "$TAG" in v0.*|*-*) echo "prerelease=--prerelease" >> "$GITHUB_OUTPUT" ;; esac
+          fi
+
+      - name: Build the app
+        run: macos/build.sh
+
+      - name: Regression checks
+        run: tests/run.sh
+
+      - name: Make the disk image
+        run: macos/make_dmg.sh
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: SDR-TV-${{ steps.version.outputs.version }}
+          path: |
+            macos/build/*.dmg
+            macos/build/*.zip
+
+      - name: Publish the release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V=${{ steps.version.outputs.version }}
+          cat > notes.md <<NOTES
+          Open the disk image and drag **SDR TV** to Applications. The app is not notarized, so the first
+          time, right-click it and choose **Open**. Needs an Apple Silicon Mac with macOS 14 or later and a HackRF One.
+          NOTES
+          gh release create "$GITHUB_REF_NAME" ${{ steps.version.outputs.prerelease }} \
+            --title "SDR TV $V" --notes-file notes.md --generate-notes \
+            "macos/build/SDR-TV-$V-macOS-arm64.dmg" "macos/build/SDR-TV-$V-macOS-arm64.zip"

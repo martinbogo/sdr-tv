@@ -4,6 +4,10 @@
 
 Free over-the-air digital TV (ATSC 1.0) on a Mac with a HackRF One.
 
+macOS only for now. Windows and Linux versions are planned, but not yet available.
+
+![Program guide](screenshots/guide.jpg)
+
 ## Features
 
 - One-minute channel scan, sorted by reception
@@ -14,6 +18,11 @@ Free over-the-air digital TV (ATSC 1.0) on a Mac with a HackRF One.
 - Program guide, from the broadcast and online sources
 - Recording, now or scheduled
 - Robust reception: multipath equalizer, automatic gain and recovery
+
+<p>
+  <img src="screenshots/welcome.png" alt="First-time setup" width="49%">
+  <img src="screenshots/channels.png" alt="Channel list with reception ratings" width="49%">
+</p>
 
 ## Requirements
 
@@ -27,11 +36,11 @@ Free over-the-air digital TV (ATSC 1.0) on a Mac with a HackRF One.
 
 ## Install
 
-1. Download `SDR-TV-<version>-macOS-arm64.zip` from the Releases page and unzip it.
-2. Move **SDR TV** to your Applications folder.
-3. The app is not notarized, so the first time, **right-click it and choose Open**, then confirm.
+1. Download `SDR-TV-<version>-macOS-arm64.dmg` from the Releases page, open it, and drag
+   **SDR TV** to Applications.
+2. The app is not notarized, so the first time, **right-click it and choose Open**, then confirm.
    Or clear the quarantine flag: `xattr -dr com.apple.quarantine "/Applications/SDR TV.app"`
-4. Connect the HackRF and open SDR TV. The first launch scans for channels (about a minute).
+3. Connect the HackRF and open SDR TV. The first launch walks you through setup and a channel scan.
 
 ## Use
 
@@ -89,6 +98,7 @@ which only run on the macOS they were built for.
 third_party/build_ffmpeg.sh          # a minimal LGPL FFmpeg, built into third_party/ffmpeg-install
 third_party/build_radio_libs.sh      # libusb and libhackrf for macOS 14+ (needs cmake: brew install cmake)
 macos/build.sh                       # builds macos/build/SDR TV.app and a zip
+macos/make_dmg.sh                    # packages the app as a drag-to-Applications disk image
 macos/build.sh --install             # runs the tests, then installs to /Applications
 ```
 

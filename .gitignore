@@ -11,3 +11,4 @@ third_party/*
 !third_party/build_radio_libs.sh
 macos/build/
 build/
+!screenshots/*.png
