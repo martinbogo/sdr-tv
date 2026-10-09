@@ -308,7 +308,8 @@ final class Player {
             if strayRun >= 15 {
                 let fix = Int64(clockNow.seconds * 90_000) + 45_000 - pts
                 videoShift += fix; pts += fix; strayRun = 0
-                if debug { FileHandle.standardError.write("player: video timestamps jumped \(-fix / 90) ms; realigned\n".data(using: .utf8)!) }
+                if debug { FileHandle.standardError.write(String(format: "player: video timestamps jumped %lld ms; realigned (%.0f ms after the channel change, clock %.1f s, rate %.0f, video %.1f s, audio %.1f s)\n",
+                    -fix / 90, Date().timeIntervalSince(flushedAt) * 1000, clockNow.seconds, sync.rate, Double(pts - fix) / 90_000, Double(latestAudioPTS) / 90_000).data(using: .utf8)!) }
             }
         }
         latestPTS = max(latestPTS, pts)

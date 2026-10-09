@@ -20,6 +20,18 @@ final class Engine {
     private let cmdLock = NSLock()
     private var cmdReset = false
     private var cmdProgram: Int?
+    // Output gate: after a station or program change, decoding carries on briefly with the old one
+    // (packets already in the pipeline). Nothing reaches the player until the media thread has
+    // made the latest change: old pictures and sound must not start the new channel's clock.
+    private var tuneSerial = 0, programSerial = 0          // cmdLock: changes asked for (main thread)
+    private var appliedTune = 0, appliedProgram = 0         // cmdLock: changes the media thread has made
+    private var cmdResetSerial = 0, cmdProgramSerial = 0
+    private var tuneSerialForDSP = 0                        // tuneLock
+
+    private func outputAllowed() -> Bool {
+        cmdLock.lock(); defer { cmdLock.unlock() }
+        return appliedTune == tuneSerial && appliedProgram == programSerial
+    }
     private var cmdAudio: Int?
     private var cmdCaptions: Int?
 
@@ -84,13 +96,17 @@ final class Engine {
         cb.ctx = ctx
         cb.video = { ctx, y, u, v, ys, uvs, w, h, sn, sd, pts in
             guard let ctx, let y, let u, let v else { return }
-            Unmanaged<Engine>.fromOpaque(ctx).takeUnretainedValue().player.video(
+            let e = Unmanaged<Engine>.fromOpaque(ctx).takeUnretainedValue()
+            guard e.outputAllowed() else { return }
+            e.player.video(
                 y: y, u: u, v: v, yStride: Int(ys), uvStride: Int(uvs), width: Int(w), height: Int(h),
                 sarNum: Int(sn), sarDen: Int(sd), pts: pts)
         }
         cb.audio = { ctx, s, n, rate, pts in
             guard let ctx, let s else { return }
-            Unmanaged<Engine>.fromOpaque(ctx).takeUnretainedValue().player.audio(stereo: s, frames: Int(n), rate: Int(rate), pts: pts)
+            let e = Unmanaged<Engine>.fromOpaque(ctx).takeUnretainedValue()
+            guard e.outputAllowed() else { return }
+            e.player.audio(stereo: s, frames: Int(n), rate: Int(rate), pts: pts)
         }
         cb.channels = { ctx, ch, n in
             guard let ctx, let ch else { return }
@@ -133,7 +149,9 @@ final class Engine {
         }
         cb.captions = { ctx, pts, json in
             guard let ctx, let json else { return }
-            Unmanaged<Engine>.fromOpaque(ctx).takeUnretainedValue().player.caption(json: String(cString: json), pts: pts)
+            let e = Unmanaged<Engine>.fromOpaque(ctx).takeUnretainedValue()
+            guard e.outputAllowed() else { return }
+            e.player.caption(json: String(cString: json), pts: pts)
         }
         cb.format = { ctx, w, h, il, ach in
             guard let ctx else { return }
@@ -167,7 +185,8 @@ final class Engine {
         device?.setFrequency(RFBand.tuneHz(rf))
         // the DSP thread resets the media layer once the receiver has dropped the old channel's
         // samples, so nothing decoded afterwards (guide events especially) belongs to the old one
-        tuneLock.lock(); tuneGen += 1; tuneHint = RFBand.pilotHint(rf); tuneRF = rf; tuneNewRF = true; tuneLock.unlock()
+        cmdLock.lock(); tuneSerial += 1; let serial = tuneSerial; cmdLock.unlock()
+        tuneLock.lock(); tuneGen += 1; tuneHint = RFBand.pilotHint(rf); tuneRF = rf; tuneNewRF = true; tuneSerialForDSP = serial; tuneLock.unlock()
         player.flush()
     }
 
@@ -183,7 +202,7 @@ final class Engine {
 
     /// Switch the decoded program within the current RF channel.
     func select(program: Int) {
-        cmdLock.lock(); cmdProgram = program; cmdLock.unlock()
+        cmdLock.lock(); programSerial += 1; cmdProgram = program; cmdProgramSerial = programSerial; cmdLock.unlock()
         player.flush()
     }
 
@@ -230,7 +249,7 @@ final class Engine {
         var seenGen = -1
         while true {
             tuneLock.lock()
-            let gen = tuneGen, hint = tuneHint, rf = tuneRF, newRF = tuneNewRF
+            let gen = tuneGen, hint = tuneHint, rf = tuneRF, newRF = tuneNewRF, serial = tuneSerialForDSP
             tuneNewRF = false
             tuneLock.unlock()
             if gen != seenGen {
@@ -241,7 +260,7 @@ final class Engine {
                 Thread.sleep(forTimeInterval: newRF ? 0.06 : 0.02)
                 cursor = ring.written & ~1
                 if let rx { atsc_rx_reset(rx, hint) }
-                if newRF { cmdLock.lock(); cmdReset = true; cmdRF = rf; cmdLock.unlock() }
+                if newRF { cmdLock.lock(); cmdReset = true; cmdRF = rf; cmdResetSerial = serial; cmdLock.unlock() }
             }
             var over = false
             let n = ring.read(cursor: &cursor, into: buf, max: chunk, overrun: &over)
@@ -270,11 +289,19 @@ final class Engine {
             _ = pktSignal.wait(timeout: .now() + .milliseconds(20))
             cmdLock.lock()
             let reset = cmdReset, rf = cmdRF, prog = cmdProgram, aud = cmdAudio, ccs = cmdCaptions
+            let resetSerial = cmdResetSerial, progSerial = cmdProgramSerial
             cmdReset = false; cmdProgram = nil; cmdAudio = nil; cmdCaptions = nil
             cmdLock.unlock()
             if let media {
-                if reset { atsc_media_reset(media); mediaRF = rf }
-                if let prog { atsc_media_select(media, Int32(prog)) }
+                if reset {
+                    atsc_media_reset(media); mediaRF = rf
+                    cmdLock.lock(); appliedTune = max(appliedTune, resetSerial); cmdLock.unlock()
+                }
+                if let prog {
+                    // open the gate first: the new program's cached keyframe is replayed right away
+                    cmdLock.lock(); appliedProgram = max(appliedProgram, progSerial); cmdLock.unlock()
+                    atsc_media_select(media, Int32(prog))
+                }
                 if let aud { atsc_media_select_audio(media, Int32(aud)) }
                 if let ccs { atsc_media_select_captions(media, Int32(ccs)) }
                 publishInfo(media)

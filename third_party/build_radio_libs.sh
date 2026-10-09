@@ -10,7 +10,8 @@ USB=1.0.30 HACKRF=2026.01.3
 [ -d hackrf-$HACKRF ] || { curl -fsSL https://github.com/greatscottgadgets/hackrf/releases/download/v$HACKRF/hackrf-$HACKRF.tar.xz | tar xJ; }
 
 ( cd libusb-$USB
-  ./configure --prefix="$OUT" --enable-static --disable-shared --disable-udev \
+  # pipe2 exists in newer SDKs only: built for macOS 14 it becomes a weak import that is missing at run time
+  ./configure --prefix="$OUT" --enable-static --disable-shared --disable-udev ac_cv_func_pipe2=no \
       CFLAGS="-mmacosx-version-min=$MIN -O2 -arch arm64" LDFLAGS="-mmacosx-version-min=$MIN -arch arm64" >/dev/null
   make -j"$(sysctl -n hw.ncpu)" >/dev/null && make install >/dev/null )
 
