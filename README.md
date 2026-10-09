@@ -1,34 +1,19 @@
 # SDR TV
 
-**Version 0.5, alpha:** an early release for testing. Expect rough edges, and please report what you find.
+**Version 0.5, alpha.** Expect rough edges; please report issues.
 
-Watch free over-the-air digital TV (ATSC 1.0, the US, Canada, Mexico and South Korea broadcast
-standard) on a Mac with a HackRF One software-defined radio. SDR TV demodulates the 8VSB signal
-itself, decodes the video, audio, captions and program guide, and plays it full screen like a TV,
-with on-screen menus that get out of the way.
+Free over-the-air digital TV (ATSC 1.0) on a Mac with a HackRF One.
 
 ## Features
 
-- **Finds your stations** with a one-minute scan, and sorts them by reception: Excellent, Good (needs
-  extra gain or the RF amplifier) and Poor. Poor channels are hidden from the channel list and guide
-  until reception improves or you choose to show them.
-- **Changes channel fast.** Subchannels of the same station switch in a few milliseconds. Other
-  stations show their last-seen picture, dimmed, until the live picture arrives, which is as soon as
-  the station sends a keyframe.
-- **MPEG-2, H.264 and HEVC video; AC-3, E-AC-3, AAC and MPEG audio.** Interlaced video is
-  deinterlaced to 60 pictures a second, as a TV shows it.
-- **Clearer standard definition:** 480-line channels are doubled in resolution with Apple's
-  real-time super-resolution (macOS 26) before they are scaled to your screen.
-- **Closed captions**, CEA-708 and CEA-608, in the broadcaster's colors, fonts and placement, or in
-  your own style. Multiple audio languages and audio description.
-- **Program guide** from each station's broadcast, with descriptions, ratings and caption and audio
-  information. Channels a station leaves empty can be filled from EPGTalk, TVmaze, an XMLTV file of
-  your choice, or your own Schedules Direct subscription.
-- **Recording**, now or scheduled from the guide. Recordings are the broadcast stream exactly as
-  received (MPEG transport stream, `.ts`); play them with VLC or IINA.
-- **Holds up in poor reception:** an adaptive equalizer for multipath, automatic gain, automatic
-  recovery when a channel will not come up, and freezing on the last good picture instead of
-  showing blocks when the signal drops out.
+- One-minute channel scan, sorted by reception
+- Fast channel changes
+- MPEG-2, H.264 and HEVC video; AC-3, AAC and MPEG audio
+- Sharper standard definition (Apple super-resolution, macOS 26)
+- Closed captions (CEA-608/708), audio languages, audio description
+- Program guide, from the broadcast and online sources
+- Recording, now or scheduled
+- Robust reception: multipath equalizer, automatic gain and recovery
 
 ## Requirements
 
