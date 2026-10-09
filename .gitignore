@@ -8,5 +8,6 @@ __pycache__/
 docs/
 third_party/*
 !third_party/build_ffmpeg.sh
+!third_party/build_radio_libs.sh
 macos/build/
 build/

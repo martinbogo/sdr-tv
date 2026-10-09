@@ -94,11 +94,13 @@ The guide shows where each listing came from.
 
 ## Build from source
 
-Requirements: Xcode command line tools and [Homebrew](https://brew.sh).
+Requirements: Xcode command line tools and [Homebrew](https://brew.sh) (for cmake). Without
+`build_radio_libs.sh`, `build.sh` falls back to Homebrew's libusb and libhackrf (`brew install hackrf`),
+which only run on the macOS they were built for.
 
 ```bash
-brew install hackrf
 third_party/build_ffmpeg.sh          # a minimal LGPL FFmpeg, built into third_party/ffmpeg-install
+third_party/build_radio_libs.sh      # libusb and libhackrf for macOS 14+ (needs cmake: brew install cmake)
 macos/build.sh                       # builds macos/build/SDR TV.app and a zip
 macos/build.sh --install             # runs the tests, then installs to /Applications
 ```

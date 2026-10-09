@@ -133,7 +133,7 @@ struct TVScreen: View {
             .foregroundStyle(.white.opacity(0.85))
         } else if tv.guideRefreshing {
             if !tv.guideVisible { GuideRefreshOSD() }
-        } else if !tv.hasPicture, !tv.liveShown, !tv.scanning, !tv.setupVisible, !tv.rechecking, tv.current != nil,
+        } else if !tv.hasPicture, !tv.liveShown, !tv.scanning, !tv.setupVisible, tv.current != nil,
                   tv.still == nil || tv.secondsSinceTune > 3 {
             TuningOSD()
         }

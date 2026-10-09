@@ -21,7 +21,7 @@ debugging such modifications.
 
 ## libhackrf
 
-- Source: https://github.com/greatscottgadgets/hackrf (host/libhackrf)
+- Source: https://github.com/greatscottgadgets/hackrf (host/libhackrf, version 2026.01.3)
 - Copyright (c) 2012-2022 Great Scott Gadgets, (c) 2012 Jared Boone, (c) 2013 Benjamin Vernoux
 - License: BSD 3-Clause. See [licenses/libhackrf-LICENSE.txt](licenses/libhackrf-LICENSE.txt)
 
@@ -32,8 +32,9 @@ debugging such modifications.
   See [licenses/libusb-COPYING.txt](licenses/libusb-COPYING.txt)
 
 libusb is linked statically. As the LGPL requires, you may modify libusb and relink the app against
-your modified version: `macos/build.sh` links whichever `libusb-1.0.a` it finds under the Homebrew
-prefix. You may also reverse-engineer the app for the purpose of debugging such modifications.
+your modified version: `third_party/build_radio_libs.sh` builds libusb (and libhackrf) into
+`third_party/radio-install`, and `macos/build.sh` links the `libusb-1.0.a` it finds there (or else
+Homebrew's). You may also reverse-engineer the app for the purpose of debugging such modifications.
 
 ## Program guide data
 

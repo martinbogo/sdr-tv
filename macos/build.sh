@@ -1,13 +1,17 @@
 #!/bin/bash
 # Builds "SDR TV.app": a self-contained Apple Silicon app with the 8VSB receiver (C),
 # a minimal LGPL FFmpeg, libhackrf and libusb all linked statically.
-#   Requires: Xcode command line tools, `brew install hackrf`, and third_party/ffmpeg-install
-#   (see ../third_party/build_ffmpeg.sh).
+#   Requires: Xcode command line tools, third_party/ffmpeg-install (../third_party/build_ffmpeg.sh)
+#   and libusb + libhackrf: third_party/radio-install (../third_party/build_radio_libs.sh, built for
+#   macOS 14 and later, used for releases) or else Homebrew's (`brew install hackrf`, built for this Mac's macOS).
 set -euo pipefail
 cd "$(dirname "$0")"
 
 BREW="$(brew --prefix)"
 FF="../third_party/ffmpeg-install"
+RADIO="../third_party/radio-install"
+if [ -f "$RADIO/lib/libhackrf.a" ] && [ -f "$RADIO/lib/libusb-1.0.a" ]; then RINC="$RADIO/include"; RLIB="$RADIO/lib"
+else RINC="$BREW/include"; RLIB="$BREW/lib"; echo "note: using Homebrew's libusb/libhackrf (built for this macOS only)"; fi
 APP="build/SDR TV.app"
 OBJ="build/obj"
 rm -rf build
@@ -20,11 +24,11 @@ clang -c -O2 -mcpu=apple-m1 -mmacosx-version-min=14.0 -o "$OBJ/atsc_captions.o" 
 
 swiftc -O -swift-version 5 -parse-as-library \
     -target arm64-apple-macos14.0 \
-    -import-objc-header Sources/Bridging.h -I "$BREW/include" \
+    -import-objc-header Sources/Bridging.h -I "$RINC" \
     Sources/*.swift \
     "$OBJ/atsc_rx.o" "$OBJ/atsc_media.o" "$OBJ/atsc_captions.o" \
     "$FF/lib/libavfilter.a" "$FF/lib/libswscale.a" "$FF/lib/libswresample.a" "$FF/lib/libavcodec.a" "$FF/lib/libavutil.a" \
-    "$BREW/lib/libhackrf.a" "$BREW/lib/libusb-1.0.a" \
+    "$RLIB/libhackrf.a" "$RLIB/libusb-1.0.a" \
     -framework Accelerate -framework AVFoundation -framework CoreMedia -framework CoreVideo \
     -framework VideoToolbox -framework IOKit -framework CoreFoundation -framework Security \
     -o "$APP/Contents/MacOS/SDR TV"

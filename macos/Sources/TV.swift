@@ -127,7 +127,6 @@ final class TV: ObservableObject {
     private var lastVideoFrames: UInt64 = 0
     private var rsHist: [(good: UInt64, bad: UInt64)] = []
     private var rescue: Rescue?
-    @Published private(set) var rechecking = false
 
     /// Receiver settings tried, in order, when a channel will not decode.
     private struct Rescue {
@@ -329,7 +328,7 @@ final class TV: ObservableObject {
     // MARK: channel list
 
     private func channelsReceived(_ list: [VirtualChannel]) {
-        if scanning || rechecking { scanFound = list; return }
+        if scanning { scanFound = list; return }
         guard !list.isEmpty else { return }
         guard let rf = list.first?.rf, rf > 0 else { return }
         library.merge(rf: rf, found: list)
@@ -1158,7 +1157,7 @@ final class TV: ObservableObject {
             if gainTestTicks % 10 == 0 { vga = vga == 20 ? 22 : 20 }
         }
         if !scanning, !guideRefreshing, snapshotTicks % 4 == 0 { superviseSchedule() }
-        if scanning || rechecking || guideRefreshing { return }
+        if scanning || guideRefreshing { return }
         noteGuideWhileWatching()
         noteQualityWhileWatching(s)
         superviseReception(s, m)
