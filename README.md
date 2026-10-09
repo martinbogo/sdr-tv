@@ -110,6 +110,8 @@ macos/build.sh --install             # runs the tests, then installs to /Applica
 `tests/run.sh` runs the regression checks: the receiver against recorded signals, the media layer,
 captions, the channel list rules and the player. Checks that need a recording in `captures/` are
 skipped when it is not there.
+`tests/first_run.sh` drives a brand-new install end to end with the HackRF connected (about two
+minutes; your own settings are not touched).
 
 ## How it works
 
