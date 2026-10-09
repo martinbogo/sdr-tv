@@ -144,6 +144,13 @@ struct GuideEvent: Codable, Hashable, Identifiable {
     var end: Date { start.addingTimeInterval(TimeInterval(duration)) }
 }
 
+/// The app's preferences. SDRTV_DEFAULTS_SUITE (tests) keeps a separate set, so an automated run never
+/// touches the real ones (with SDRTV_DATA_DIR for the files).
+enum AppDefaults {
+    static let store: UserDefaults = ProcessInfo.processInfo.environment["SDRTV_DEFAULTS_SUITE"]
+        .flatMap { UserDefaults(suiteName: $0) } ?? .standard
+}
+
 /// Persistent channel list and broadcast guide (Application Support/SDR TV).
 final class Library {
     static let folder: URL = {
@@ -356,13 +363,13 @@ final class Library {
 
     /// When each RF channel's guide was last read completely (RF channel -> time).
     private(set) var guideUpdated: [Int: Date] = {
-        let d = UserDefaults.standard.dictionary(forKey: "guideUpdated") as? [String: Double] ?? [:]
+        let d = AppDefaults.store.dictionary(forKey: "guideUpdated") as? [String: Double] ?? [:]
         return Dictionary(uniqueKeysWithValues: d.compactMap { k, v in Int(k).map { ($0, Date(timeIntervalSince1970: v)) } })
     }()
 
     func markGuideUpdated(rf: Int) {
         guideUpdated[rf] = Date()
-        UserDefaults.standard.set(Dictionary(uniqueKeysWithValues: guideUpdated.map { (String($0.key), $0.value.timeIntervalSince1970) }),
+        AppDefaults.store.set(Dictionary(uniqueKeysWithValues: guideUpdated.map { (String($0.key), $0.value.timeIntervalSince1970) }),
                                   forKey: "guideUpdated")
     }
 

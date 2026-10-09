@@ -36,6 +36,9 @@ struct TVCommands: Commands {
                 .keyboardShortcut("r")
             Button("Show Recordings in Finder") { tv.revealRecordings() }
         }
+        CommandGroup(replacing: .help) {
+            Button("Getting Started with SDR TV") { tv.showIntro() }
+        }
         CommandMenu("Channel") {
             Button("Channel Up") { tv.step(1) }.keyboardShortcut(.upArrow, modifiers: .command)
             Button("Channel Down") { tv.step(-1) }.keyboardShortcut(.downArrow, modifiers: .command)

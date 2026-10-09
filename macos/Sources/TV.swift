@@ -6,7 +6,7 @@ final class TV: ObservableObject {
     static let shared = TV()
     let engine = Engine()
     let library = Library()
-    private let defaults = UserDefaults.standard
+    private let defaults = AppDefaults.store
 
     // tuner settings
     @Published var ampOn: Bool { didSet { defaults.set(ampOn, forKey: "amp"); engine.device?.setAmp(ampOn) } }
@@ -94,7 +94,9 @@ final class TV: ObservableObject {
     @Published private(set) var guideRefreshing = false
     @Published private(set) var guideRefreshProgress = 0.0
     @Published private(set) var guideRefreshNote = ""
-    @Published var setupVisible = false             // modal scan window (first run, or a rescan)
+    @Published var setupVisible = false
+    /// The introduction (what SDR TV is, connecting the HackRF, antennas) at the start of setup.
+    @Published private(set) var introVisible = false             // modal scan window (first run, or a rescan)
     var firstRun: Bool { !defaults.bool(forKey: "initialScanDone") }
     @Published private(set) var recordingSince: Date?
     // scheduled recordings
@@ -216,11 +218,13 @@ final class TV: ObservableObject {
         do {
             try engine.open(rf: rf, amp: ampOn, lna: lna, vga: vga)
             deviceError = nil
-            if firstRun || library.channels.isEmpty { beginSetup() }
+            if introVisible { }                                 // the scan starts when the introduction ends
+            else if firstRun && !setupVisible { introVisible = true; setupVisible = true }
+            else if firstRun || library.channels.isEmpty { beginSetup() }
             else if let start, !setupVisible { tune(start, showBanner: true) }
         } catch {
             deviceError = error.localizedDescription
-            if firstRun { setupVisible = true }      // the setup window explains what is missing
+            if firstRun, !setupVisible { introVisible = true; setupVisible = true }   // it explains how to connect
         }
     }
 
@@ -230,6 +234,15 @@ final class TV: ObservableObject {
         scanFinished = false
         scanResults = []
         if deviceError == nil { scan() }
+    }
+
+    /// Help > Getting Started: the introduction again (no rescan afterwards).
+    func showIntro() { introVisible = true; setupVisible = true }
+
+    /// End of the introduction (finished or skipped): scan if there are no channels yet, else close.
+    func endIntro() {
+        introVisible = false
+        if firstRun || library.channels.isEmpty { beginSetup() } else { setupVisible = false }
     }
 
     /// Close the scan window and start watching.

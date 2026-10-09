@@ -960,12 +960,126 @@ struct RecordingSettings: View {
 
 // MARK: - setup / scan window
 
+/// First launch (and Help > Getting Started): what SDR TV is, connecting the HackRF, antennas.
+/// Experienced users skip it from any page.
+struct IntroView: View {
+    @EnvironmentObject var tv: TV
+    @State private var page = 0
+    private let pages = 4
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 14) {
+                Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 56, height: 56)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(["Welcome to SDR TV", "Connect your HackRF", "The antenna", "Find your channels"][page])
+                        .font(.title2.weight(.semibold))
+                    Text("Step \(page + 1) of \(pages)").foregroundStyle(.secondary)
+                }
+            }
+            Group {
+                switch page {
+                case 0: welcome
+                case 1: connect
+                case 2: antenna
+                default: scan
+                }
+            }
+            .font(.callout)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(minHeight: 140, alignment: .topLeading)
+            HStack {
+                if page < pages - 1 {
+                    Button(tv.firstRun ? "Skip Introduction" : "Close") { tv.endIntro() }
+                        .accessibilityIdentifier("intro.skip")
+                }
+                Spacer()
+                if page > 0 { Button("Back") { page -= 1 }.accessibilityIdentifier("intro.back") }
+                if page < pages - 1 {
+                    Button("Next") { page += 1 }.keyboardShortcut(.defaultAction).accessibilityIdentifier("intro.next")
+                } else {
+                    Button(tv.firstRun ? "Scan for Channels" : "Done") { tv.endIntro() }
+                        .keyboardShortcut(.defaultAction).accessibilityIdentifier("intro.scan")
+                }
+            }
+        }
+        .padding(24)
+        .frame(width: 560)
+    }
+
+    private func bullet(_ text: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) { Text("•"); Text(text) }
+    }
+
+    private var welcome: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("SDR TV turns a HackRF One into a tuner for free over-the-air digital TV (ATSC 1.0).")
+            Text("You will need:").fontWeight(.semibold)
+            bullet("A HackRF One (or a PortaPack)")
+            bullet("A USB data cable")
+            bullet("A TV antenna")
+            
+            Text("Setup takes about two minutes.")
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var connect: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            bullet("Connect it with a USB data cable, directly or through a powered hub.")
+            bullet("PortaPack: choose HackRF from its main menu first.")
+            bullet("Attach the antenna to the ANTENNA port.")
+            HStack(spacing: 8) {
+                if tv.deviceError == nil {
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                    Text("HackRF connected").fontWeight(.semibold)
+                } else {
+                    ProgressView().controlSize(.small)
+                    Text("Looking for the HackRF…").foregroundStyle(.orange)
+                }
+            }
+            .padding(.top, 4)
+            .accessibilityIdentifier("intro.deviceStatus")
+        }
+    }
+
+    private var antenna: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Most stations are UHF (470 to 608 MHz); some are VHF.")
+            bullet("Telescoping whip: about 14 cm (5.5 in) for UHF, 36 cm (14 in) or more for VHF.")
+            bullet("Hold it horizontal: TV is horizontally polarized.")
+            bullet("A real TV antenna (with an F-to-SMA adapter) gets more stations.")
+            bullet("Best near a window, away from computers.")
+        }
+    }
+
+    private var scan: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(tv.firstRun
+                 ? "Scan every TV channel now (about a minute)."
+                 : "To scan again: Channel > Scan for Channels (S).")
+            if tv.firstRun {
+                Text("You can rescan any time from the Channel menu.")
+                    .foregroundStyle(.secondary)
+                if tv.deviceError != nil {
+                    Label("Waiting for the HackRF.", systemImage: "cable.connector.slash")
+                        .foregroundStyle(.orange)
+                }
+            }
+        }
+    }
+}
+
 /// Shown on first launch (and for rescans): scans every RF channel with the picture hidden,
 /// then saves the channel list for later launches.
 struct SetupSheet: View {
     @EnvironmentObject var tv: TV
 
     var body: some View {
+        if tv.introVisible { IntroView() } else { scanView }
+    }
+
+    private var scanView: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(spacing: 14) {
                 Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 56, height: 56)
@@ -1009,7 +1123,7 @@ struct SetupSheet: View {
             }
             HStack {
                 if tv.scanning {
-                    Button("Stop") { tv.cancelScan() }
+                    Button("Stop") { tv.cancelScan() }.accessibilityIdentifier("setup.stop")
                 } else if tv.scanFinished && tv.scanResults.isEmpty || tv.deviceError == nil && !tv.scanFinished {
                     Button("Scan Again") { tv.beginSetup() }.disabled(tv.deviceError != nil)
                 }
@@ -1018,6 +1132,7 @@ struct SetupSheet: View {
                     Button("Close") { tv.finishSetup() }
                 }
                 Button("Start Watching") { tv.finishSetup() }
+                    .accessibilityIdentifier("setup.startWatching")
                     .keyboardShortcut(.defaultAction)
                     .disabled(tv.scanning || tv.channels.isEmpty)
             }
@@ -1028,9 +1143,9 @@ struct SetupSheet: View {
 
     private var subtitle: String {
         if tv.deviceError != nil { return "Waiting for the HackRF" }
-        if tv.scanning { return "Finding the TV stations your antenna receives. This takes about a minute." }
+        if tv.scanning { return "Scanning for TV stations. This takes about a minute." }
         if tv.scanResults.isEmpty { return "The scan found no digital TV stations." }
-        return "Found \(tv.scanResults.count) channels. They are saved, so this runs only once."
+        return "Found \(tv.scanResults.count) channels."
     }
 
     private var progressText: String {
