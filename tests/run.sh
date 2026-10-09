@@ -99,5 +99,16 @@ if [ -x "$OUT/player_tests" ]; then
     [ "${PIPESTATUS[0]}" -eq 0 ] || fail=1
 fi
 
+echo "release build"
+APPBIN="macos/build/SDR TV.app/Contents/MacOS/SDR TV"
+if [ -f "$APPBIN" ]; then
+    # a C function weakly imported from a newer SDK is missing on older macOS (or even this one): crash at launch
+    # allowed: Swift symbols and markers, and Objective-C classes (newer frameworks, used behind availability checks)
+    weak=$(nm -m "$APPBIN" | grep "weak external" | grep -vE '__availability_version_check|weak external _[$]s|_OBJC_CLASS_[$]_|__swift_FORCE_LOAD|from libswift' | sed -E 's/.*weak external //' | head -5)
+    if [ -z "$weak" ]; then pass "no weak imports of C functions"; else bad "weak imports (may crash at launch): $weak"; fi
+    minos=$(otool -l "$APPBIN" | grep -A3 LC_BUILD_VERSION | awk '/minos/{print $2; exit}')
+    [ "$minos" = "14.0" ] && pass "runs on macOS $minos and later" || bad "minimum macOS is $minos (expected 14.0)"
+else skip "release build checks" "../macos/build (run macos/build.sh first)"; fi
+
 [ $fail -eq 0 ] && echo "All checks passed." || echo "Some checks FAILED."
 exit $fail
