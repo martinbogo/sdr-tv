@@ -113,17 +113,6 @@ skipped when it is not there.
 `tests/first_run.sh` drives a brand-new install end to end with the HackRF connected (about two
 minutes; your own settings are not touched).
 
-## How it works
-
-- `dsp/atsc_rx.c`: the 8VSB receiver. Pilot acquisition, symbol timing recovery, an adaptive
-  decision-feedback equalizer, trellis (Viterbi) decoding, deinterleaving, Reed-Solomon error
-  correction and derandomizing, on three threads.
-- `dsp/atsc_media.c`: MPEG transport stream demultiplexing, the ATSC program and guide tables
-  (PSIP), and decoding with FFmpeg.
-- `dsp/atsc_captions.c`: CEA-608 and CEA-708 caption decoders.
-- `macos/Sources`: the SwiftUI app, playback with AVFoundation, and the online guide sources.
-- `prototype/`: the Python reference implementation the receiver was developed against.
-
 ## Limitations
 
 - One HackRF receives one station (RF channel) at a time.
