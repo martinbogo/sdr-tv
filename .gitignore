@@ -6,6 +6,7 @@ captures/
 __pycache__/
 .DS_Store
 docs/
-third_party/
+third_party/*
+!third_party/build_ffmpeg.sh
 macos/build/
 build/
