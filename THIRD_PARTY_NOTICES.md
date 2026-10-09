@@ -1,7 +1,7 @@
 # Third-party notices
 
 The SDR TV app binary statically links the libraries below. They are **not** covered by this
-project's CC BY-NC 4.0 license. Each remains under its own license, reproduced in `licenses/`, and
+project's PolyForm Noncommercial 1.0.0 license. Each remains under its own license, reproduced in `licenses/`, and
 the same files are included inside the app bundle at `Contents/Resources/Licenses`.
 
 ## FFmpeg

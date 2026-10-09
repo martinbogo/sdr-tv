@@ -1,5 +1,7 @@
 # SDR TV
 
+**Version 0.5, alpha:** an early release for testing. Expect rough edges, and please report what you find.
+
 Watch free over-the-air digital TV (ATSC 1.0, the US, Canada, Mexico and South Korea broadcast
 standard) on a Mac with a HackRF One software-defined radio. SDR TV demodulates the 8VSB signal
 itself, decodes the video, audio, captions and program guide, and plays it full screen like a TV,
@@ -130,9 +132,17 @@ skipped when it is not there.
 
 Copyright (c) 2026 Martin Bogomolni
 
-SDR TV is licensed under the
-[Creative Commons Attribution-NonCommercial 4.0 International License](https://creativecommons.org/licenses/by-nc/4.0/).
-See [LICENSE](LICENSE).
+SDR TV is licensed under the [PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0)
+(see [LICENSE](LICENSE)). In short:
+
+- You may use, study, change and share it for any **noncommercial** purpose: personal use, hobby
+  projects, research, education, and noncommercial organizations.
+- **Commercial use is not permitted**, including selling it, using it in a business, or including any
+  part of it in commercial software or products. For commercial licensing, contact the author.
+- Anyone you share it with, changed or not, must get the license and this notice:
+  `Required Notice: Copyright (c) 2026 Martin Bogomolni`
+
+The summary above is for convenience; the license text governs.
 
 The app includes FFmpeg (LGPL 2.1), libhackrf (BSD 3-Clause) and libusb (LGPL 2.1), each under its
 own license. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
