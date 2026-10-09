@@ -16,21 +16,21 @@ jobs:
   release:
     runs-on: macos-26         # the macOS 26 SDK is needed for the standard-definition enhancement
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Select the newest Xcode
         run: sudo xcode-select -s "$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
 
       - name: Restore FFmpeg
         id: ffmpeg
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: third_party/ffmpeg-install
           key: ffmpeg-${{ runner.os }}-${{ hashFiles('third_party/build_ffmpeg.sh') }}
 
       - name: Restore libusb and libhackrf
         id: radio
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: third_party/radio-install
           key: radio-${{ runner.os }}-${{ hashFiles('third_party/build_radio_libs.sh') }}
@@ -66,7 +66,7 @@ jobs:
         run: macos/make_dmg.sh
 
       - name: Upload build
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: SDR-TV-${{ steps.version.outputs.version }}
           path: |
