@@ -1,6 +1,6 @@
 # SDR TV
 
-**Version 0.5, alpha.** Expect rough edges; please report issues.
+**Version 0.5.1, alpha.** Expect rough edges; please report issues.
 
 Free over-the-air digital TV (ATSC 1.0) on a Mac with a HackRF One.
 
