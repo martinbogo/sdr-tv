@@ -59,6 +59,8 @@ struct PlayerTests {
                                               ("station B, clock 26 hours behind A", 90_000 * 400),
                                               ("station C, clock ahead of B", 90_000 * 60_000),
                                               ("station B again", 90_000 * 400)]
+            // unmeasured warm-up: the first audio output after launch can start late (slow on CI virtual machines)
+            play(p, base: 90_000 * 100, seconds: 1.0)
             for (name, base) in stations {
                 p.flush()
                 play(p, base: base, seconds: 1.6)
